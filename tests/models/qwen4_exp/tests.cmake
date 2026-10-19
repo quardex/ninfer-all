@@ -15,6 +15,10 @@ add_test(NAME ninfer_qwen4_exp_ngram_writer_interop_test
     $<TARGET_FILE:ninfer_tests>)
 set_tests_properties(ninfer_qwen4_exp_ngram_writer_interop_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_qwen4_exp_kv_page_pool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_page_pool.cpp"
+  LIBRARIES ninfer_model_loading)
+
 ninfer_add_test(ninfer_qwen4_exp_config_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
   NEEDS_SOURCE_DIR

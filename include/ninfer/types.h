@@ -645,6 +645,12 @@ struct EngineOptions {
     std::optional<std::uint32_t> kv_resident_positions;
     // Qwen3.8-Flash-Next only.
     StagePipelineOptions stage_pipeline;
+    // Qwen3.8-Flash-Next only: the sequences share one KV pool of this many positions, at least
+    // max_context and fewer than max_concurrency x max_context, instead of a window each. A
+    // sequence takes pages as its positions grow and gives them back when another request needs
+    // them; the sequences keep no context-cache images in host memory or on disk, and every
+    // position's KV stays on the device. Zero: a window per sequence.
+    std::uint32_t kv_pool_tokens = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
