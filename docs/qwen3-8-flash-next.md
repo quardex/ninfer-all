@@ -218,6 +218,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
+| `--kv-pool N` | (ninfer-serve) the sequences share one KV pool of `N` positions instead of a window each ([the context cache](#sequences-kv-and-the-context-cache)); off by default |
 | `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
@@ -457,6 +458,21 @@ for each chunk's worth of prompt the step computes, at least one, so a short pro
 one round and the streams keep their share during a long one; each round is one batched pass
 whose experts read their weights once for the whole batch, so the batch costs little more than one
 token while the experts dominate the step.
+
+`--kv-pool N` (ninfer-serve), at least `--max-context` and fewer than `--max-concurrency` windows,
+makes the sequences share one KV pool of `N` positions instead: every sparse-attention layer (and
+the MTP layer) keeps one set of KV planes, and a sequence's block table maps its positions' pages
+into them, taken as it grows and returned when its sequence is reset. So four sequences of 262,144
+tokens can share 262,144 positions: one long request and short ones beside it, or several of any
+length while they fit together, each up to `--max-context`. A request takes pages for its prompt
+when it is admitted and for a few rounds ahead before each decode step; when the pool is short, a
+free sequence gives up its pages (and its cached prefix), least recently used first. A prompt that
+does not fit beside the running requests waits in the queue; a decoding request that finds no
+pages left finishes at its context capacity. A sequence still costs its own pooled keys (1.5 KiB a
+position of `--max-context`) and recurrent state: about 0.45 GiB a sequence at 262,144 tokens.
+Every position's KV stays on the device (a `--kv-resident` window below `--max-context` is
+refused), and the sequences keep no context-cache images in host memory or on disk: their pages go
+back to the pool, so explicit host or disk cache capacities are refused with it.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end

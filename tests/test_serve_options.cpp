@@ -1429,6 +1429,33 @@ int main() {
                                   .concurrent_prefill &&
                               !parse({"ninfer-serve", "model.ninfer"}).concurrent_prefill,
                           "--concurrent-prefill was not an off-by-default switch");
+        {
+            // --kv-pool (Flash-Next): off by default, reaches the Engine, and keeps no host or
+            // disk context cache, though explicit zero host capacities are what it runs with.
+            const auto pooled = parse({"ninfer-serve", "model.ninfer", "--kv-pool", "262144"});
+            failures += check(pooled.kv_pool_tokens == 262144U &&
+                                  make_engine_options(pooled).kv_pool_tokens == 262144U &&
+                                  parse({"ninfer-serve", "model.ninfer"}).kv_pool_tokens == 0U,
+                              "--kv-pool was on by default or did not reach the Engine");
+            failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-pool", "4096",
+                                     "--host-state-slots", "0", "--host-kv-mib", "0"})
+                                      .kv_pool_tokens == 4096U,
+                              "--kv-pool refused explicit zero host capacities");
+            for (const std::vector<std::string>& arguments :
+                 {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-pool", "0"},
+                  std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-pool", "4096",
+                                           "--host-kv-mib", "1024"},
+                  std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-pool", "4096",
+                                           "--host-state-slots", "2"}}) {
+                bool rejected = false;
+                try {
+                    (void)parse(arguments);
+                } catch (const std::invalid_argument&) { rejected = true; }
+                const std::string message = "--kv-pool accepted " + arguments[3] + " " +
+                                            (arguments.size() > 4 ? arguments[4] : "");
+                failures += check(rejected, message.c_str());
+            }
+        }
         failures += check(parse({"ninfer-serve", "model.ninfer", "--recover-invariant-failures"})
                                   .recover_invariant_failures &&
                               !parse({"ninfer-serve", "model.ninfer"}).recover_invariant_failures,
