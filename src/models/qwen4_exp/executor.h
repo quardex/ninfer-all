@@ -33,9 +33,17 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
+
+// A pipeline stage's thread (ExecutorOptions::rank_threads) failed. The passes queued after it were
+// skipped, so no sequence's state can be trusted: every later call that waits on the threads
+// throws this, which is no request's error.
+struct RankThreadsFailed : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct ExecutorOptions {
     std::uint32_t max_context = 32768;
@@ -74,6 +82,11 @@ struct ExecutorOptions {
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
     // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
     ops::RopeYarn rope_yarn;
+    // Pipeline stages with device experts (EngineOptions::stage_pipeline): each stage's work queued
+    // by its own host thread, and with it, for a lone decoding sequence with MTP drafts and CUDA
+    // Graphs, the front stages running the guessed next window while the head verifies one.
+    bool rank_threads     = false;
+    bool pipeline_windows = false;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -228,6 +241,24 @@ public:
     // then what feeding those tokens would have left, and its MTP block has run their cells.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
 
+    // Pipeline windows (ExecutorOptions::pipeline_windows, a lone decoding sequence): while the
+    // head rank verifies a window, the front ranks run the guessed next one.
+    [[nodiscard]] bool pipeline_windows() const noexcept;
+    // After draft() and before verify(): the MTP chain runs on past the drafts to the guess.
+    void guess_after_draft();
+    // The last guess: the bonus token the window in flight would end with if kept whole, then
+    // the drafts after it (draft_tokens() + 1 tokens). Waits for the head rank's chain.
+    void take_guess(std::span<std::int32_t> out);
+    // The front ranks run `tokens` (a guess) as the window after the one in flight.
+    void verify_ahead(std::span<const std::int32_t> tokens);
+    [[nodiscard]] bool guess_live() const noexcept;
+    // The verdict did not keep the window in flight whole with the guessed bonus.
+    void drop_guess();
+    // After commit() kept the window in flight whole with the guessed bonus: verifies the guessed
+    // window (`tokens`, as guessed), whose front ranks' part has run, and starts the next guess
+    // chain (take_guess()).
+    void verify_guessed(std::span<const std::int32_t> tokens);
+
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
     [[nodiscard]] std::size_t head_rank() const noexcept;
     [[nodiscard]] ExpertCacheStats expert_cache_stats() const noexcept;
@@ -239,7 +270,8 @@ public:
     // Worker-thread scope only. The owner retains the flag until the eager call returns, then
     // clears the borrow. No consumer thread mutates Program state through this method.
     void bind_cancellation(const std::atomic<bool>* cancelled) noexcept;
-    [[nodiscard]] cudaStream_t head_stream() const noexcept;
+    // Waits until the head rank's thread has queued every posted pass (rank threads).
+    [[nodiscard]] cudaStream_t head_stream() const;
 
 private:
     struct Impl;

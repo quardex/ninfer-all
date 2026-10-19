@@ -213,6 +213,15 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
            std::string(product::kKvResidentHelp) +
+           "  --rank-threads                Qwen3.8-Flash-Next over --devices with device\n"
+           "                                experts: each stage's work is queued by its own\n"
+           "                                host thread, so prompt chunks fill every stage\n"
+           "                                (GPUs without peer access); same outputs\n"
+           "  --pipeline-windows            with --rank-threads and MTP: while the last\n"
+           "                                stage verifies a window, the stages before it\n"
+           "                                run the guessed next one (a lone request without\n"
+           "                                logprobs, a grammar or --draft-min-p); same\n"
+           "                                outputs\n"
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1099,6 +1108,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                               [&] { return require_value(arg.c_str()); })) {
             continue;
         }
+        if (arg == "--rank-threads") {
+            options.stage_pipeline.rank_threads = true;
+            continue;
+        }
+        if (arg == "--pipeline-windows") {
+            options.stage_pipeline.pipeline_windows = true;
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1642,6 +1659,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {
         throw std::invalid_argument("--long-anchor-spacing requires --auto-long-anchors");
+    }
+    if (options.stage_pipeline.pipeline_windows && !options.stage_pipeline.rank_threads) {
+        throw std::invalid_argument("--pipeline-windows requires --rank-threads");
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

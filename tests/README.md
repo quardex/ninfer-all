@@ -232,6 +232,8 @@ NINFER_FLASH_NEXT_DEVICES=0,1 \
 ```
 
 `NINFER_FLASH_NEXT_CACHE_ONLY=1` runs the image spill/restore/isolation regression alone.
+`NINFER_FLASH_NEXT_STAGES_ONLY=1` runs the pipeline stages' modes alone: rank threads and pipeline
+windows against host-ordered passes (each request's tokens).
 `NINFER_FLASH_NEXT_SAMPLING_ONLY=1` repeats the seeded K=1 request over three sequence slots,
 with and without CUDA graphs, and reports the first differing token's top-logprob records.
 On Linux, `ninfer_qwen4_exp_peer_copy_order_test` repeats that workload while delaying alternate
