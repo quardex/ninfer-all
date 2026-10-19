@@ -75,6 +75,29 @@ profile of its own card. The context-cost model of the prefix cache is the first
   (`ScopedDeviceRank`, `ScopedArenaRank`), receives the residual and control block, runs the stage's
   layers and passes the residual on.
 
+### Qwen3.8-Flash-Next's stages
+
+Flash-Next keeps its own stage loop (`models/qwen4_exp/executor.cpp`): segments of consecutive
+layers per device, the residual stack handed on between them, and the head, sampling and MTP block
+on the last stage. By default one host thread queues a pass's segments stage after stage. Between
+GPUs without peer access (Windows/WDDM) every cross-stage wait blocks that thread until the other
+device gets there, so the stages take turns. Two opt-in modes (`EngineOptions::stage_pipeline`)
+change the queuing, never the arithmetic:
+
+- **Rank threads.** The Engine's thread stages a pass's inputs (tokens, positions, n-gram rows) in
+  a ring of pinned host entries and posts the pass; each stage's thread uploads them, waits on the
+  host for its stack from the stage before (through a ring of pinned buffers per boundary, counted
+  in the same order on both sides) and runs its segments. Prompt chunks then fill every stage at
+  once, which is the overlap the bullet below says Qwen3.5's pipeline lacks. Calls that read
+  results or state wait until the threads have queued every posted pass; a thread's failure stops
+  the Engine, since the passes queued after it were skipped.
+- **Pipeline windows.** For a lone decoding request with MTP drafts, the head stage's thread runs
+  the draft chain on past the round's drafts to the window that would follow if this one is kept
+  whole, and the front stages run that guessed window from shadow states (a second slot of each
+  Gated DeltaNet pool, copies of the indexer tails and PLE histories) while the head verifies the
+  current one; a second set of replay records keeps every prefix of the window in flight
+  committable. A wrong guess is dropped.
+
 ## What is not covered yet
 
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
