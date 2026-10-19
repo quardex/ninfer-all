@@ -542,6 +542,19 @@ struct HybridExpertOptions {
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
 };
 
+// Qwen3.8-Flash-Next's pipeline stages (EngineOptions::devices) with device experts: how the host
+// queues the stages' work. None of these modes changes an output.
+struct StagePipelineOptions {
+    // Each stage's work is queued by its own host thread, so prompt chunks fill every stage
+    // instead of the stages taking turns: between GPUs without peer access (Windows/WDDM) a stream
+    // wait or a staged copy blocks the thread that queues it until the other GPU gets there.
+    bool rank_threads = false;
+    // With rank threads, MTP drafts and CUDA Graphs, for a lone decoding request without logprobs,
+    // a grammar or a draft probability floor: while the head stage verifies a window, the stages
+    // before it run the window the MTP block guesses will follow; a wrong guess is dropped.
+    bool pipeline_windows = false;
+};
+
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
 enum class NgramResidency : std::uint8_t {
     // The table's file, with a bounded cache of rows read as the hash addresses them.
@@ -619,6 +632,8 @@ struct EngineOptions {
     // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
     // disk experts, every position with device experts; 0 keeps every position.
     std::optional<std::uint32_t> kv_resident_positions;
+    // Qwen3.8-Flash-Next only.
+    StagePipelineOptions stage_pipeline;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
