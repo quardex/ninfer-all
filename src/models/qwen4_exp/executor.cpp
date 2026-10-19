@@ -15,6 +15,7 @@
 #include "models/expert_profile.h"
 #include "models/qwen4_exp/expert_misses.h"
 #include "models/qwen4_exp/expert_stream.h"
+#include "models/qwen4_exp/kv_page_pool.h"
 #include "models/qwen4_exp/ngram_table.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "ninfer/ops/argmax.h"
@@ -798,6 +799,14 @@ struct Executor::Impl {
             domain         = static_cast<std::int32_t>(model.resources().public_token_count);
         }
         pages          = (options.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        if (options.kv_pool_tokens != 0) {
+            const std::uint64_t asked =
+                (std::uint64_t(options.kv_pool_tokens) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            // A pool that holds every sequence's whole window is no pool.
+            if (asked < std::uint64_t(pages) * options.sequences) {
+                pool_pages = static_cast<std::uint32_t>(asked);
+            }
+        }
         pooled_slots   = options.max_context / config.indexer_compress_ratio + 1;
         kv_layout =
             paged_kv_storage_layout(options.kv_cache, static_cast<std::int32_t>(config.head_dim));
@@ -811,6 +820,12 @@ struct Executor::Impl {
                 stream_slots = slots;
                 stream_width = width;
             }
+        }
+        if (stream_slots != 0 && pool_pages != 0) {
+            // Streamed layers keep each sequence's own host copy of its KV.
+            throw std::invalid_argument("qwen4_exp: a shared KV pool keeps every position's KV on "
+                                        "the device; streamed KV (kv_resident below max_context) "
+                                        "keeps a window per sequence");
         }
         memory.ranks.resize(device.size());
         plan_weights();
@@ -1248,8 +1263,15 @@ struct Executor::Impl {
             const std::uint32_t slots = options.sequences + (pipeline ? 1 : 0);
             std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, slots));
             std::iota(identity.begin(), identity.end(), 0);
-            rank.block_table = DeviceBuffer(std::size_t(pages) * 4);
-            rank.block_table.copy_from_host(identity.data(), std::size_t(pages) * 4);
+            if (pool_pages == 0) {
+                rank.block_table = DeviceBuffer(std::size_t(pages) * 4);
+                rank.block_table.copy_from_host(identity.data(), std::size_t(pages) * 4);
+            } else {
+                // A table per sequence into the shared pool, filled as its pages are taken.
+                const std::vector<std::int32_t> zeros(std::size_t(pages) * options.sequences, 0);
+                rank.block_table = DeviceBuffer(zeros.size() * 4);
+                rank.block_table.copy_from_host(zeros.data(), zeros.size() * 4);
+            }
             rank.slot_ids = DeviceBuffer(std::size_t(slots) * 4);
             rank.slot_ids.copy_from_host(identity.data(), std::size_t(slots) * 4);
             // ids, positions, RoPE positions, scatter columns, three-axis RoPE positions, rows.
@@ -1396,13 +1418,30 @@ struct Executor::Impl {
         return cache;
     }
 
+    // A sparse-attention layer's KV planes of `count` pages in device memory (a shared pool's).
+    void allocate_device_kv(LayerState& state, std::size_t rank, std::uint32_t count) {
+        std::uint64_t device_kv = 0;
+        const auto planes       = kv_planes();
+        for (std::size_t i = 0; i < planes.size(); ++i) {
+            if (planes[i].first == 0) { continue; }
+            KvPlane& plane = state.kv[i];
+            plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, count);
+            plane.device   = DeviceBuffer(plane.bytes);
+            plane.p        = plane.device.p;
+            device_kv += plane.bytes;
+        }
+        memory.ranks[rank].state_bytes += device_kv;
+        memory.kv_bytes += device_kv;
+    }
+
     // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
     // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail. A
     // streamed layer keeps the paged KV in pinned host memory, and its pool and map on the device.
     void allocate_attention_state(LayerState& state, std::size_t rank) {
         std::uint64_t device_kv = 0, bytes = 0;
         const auto planes       = kv_planes();
-        for (std::size_t i = 0; i < planes.size(); ++i) {
+        // A shared KV pool keeps the planes once, in pool_kv.
+        for (std::size_t i = 0; pool_pages == 0 && i < planes.size(); ++i) {
             if (planes[i].first == 0) { continue; }
             KvPlane& plane = state.kv[i];
             plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, pages);
@@ -1501,9 +1540,84 @@ struct Executor::Impl {
         }
     }
 
+    // ---- Shared KV pool (ExecutorOptions::kv_pool_tokens) ----
+    // One set of KV planes per sparse-attention layer (and the MTP layer) of pool_pages pages; a
+    // sequence's block table maps its positions' pages into them, taken from the pool as the
+    // sequence grows and returned at reset (KvPagePool). The host stages a sequence's new table
+    // entries in pinned memory and copies them to every rank's table on that rank's stream before
+    // the pass that first writes them.
+    std::uint32_t pool_pages = 0;
+    std::vector<LayerState> pool_kv; // by layer; index layers.size() is the MTP layer
+    KvPagePool page_pool;
+    std::unique_ptr<PinnedHostBuffer> table_host; // [sequences][pages]
+
+    void allocate_pool() {
+        pool_kv.resize(layers.size() + 1);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            if (!layers[i].qsa) { continue; }
+            RankBinding bind(device, layers[i].rank);
+            allocate_device_kv(pool_kv[i], layers[i].rank, pool_pages);
+        }
+        if (mtp) {
+            RankBinding bind(device, model.head_rank());
+            allocate_device_kv(pool_kv[layers.size()], model.head_rank(), pool_pages);
+        }
+        page_pool  = KvPagePool(pool_pages, pages, options.sequences);
+        table_host = std::make_unique<PinnedHostBuffer>(std::size_t(pages) * options.sequences * 4);
+        std::memset(table_host->data(), 0, table_host->size());
+        std::fprintf(stderr, "qwen4_exp: %u sequences share a KV pool of %llu tokens\n",
+                     options.sequences,
+                     static_cast<unsigned long long>(pool_pages) * kPagedKVPageSize);
+    }
+
+    // Pages for `sequence`'s positions up to `tokens` (at most max_context): true when it holds
+    // them now; false, taking none, when the pool lacks some.
+    bool reserve_pages(const SequenceState& sequence, std::uint64_t tokens) {
+        if (pool_pages == 0) { return true; }
+        const auto need = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            (tokens + kPagedKVPageSize - 1) / kPagedKVPageSize, pages));
+        const std::size_t first = page_pool.held_pages(sequence.slot);
+        if (!page_pool.reserve(sequence.slot, need)) { return false; }
+        const std::size_t more = page_pool.held_pages(sequence.slot) - first;
+        if (more == 0) { return true; }
+        // Staged in pinned memory, which a reset (after its passes) alone rewrites.
+        auto* table = static_cast<std::int32_t*>(table_host->data()) +
+                      std::size_t(sequence.slot) * pages;
+        std::copy_n(page_pool.table(sequence.slot).begin() + std::ptrdiff_t(first), more,
+                    table + first);
+        for (RankState& rank : ranks) {
+            RankBinding bind(device, rank.rank);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(rank.block_table.p) +
+                                           std::size_t(sequence.slot) * pages + first,
+                                       table + first, more * 4, cudaMemcpyHostToDevice,
+                                       rank.stream));
+        }
+        return true;
+    }
+
+    void require_pages(const SequenceState& sequence, std::uint64_t tokens) {
+        if (!reserve_pages(sequence, tokens)) {
+            throw KvPoolExhausted("qwen4_exp: the shared KV pool has no pages left for sequence " +
+                                  std::to_string(sequence.slot));
+        }
+    }
+
+    // Returns a sequence's pages; the caller has waited for every pass that reads them.
+    void release_pages(const SequenceState& sequence) {
+        if (pool_pages != 0) { page_pool.release(sequence.slot); }
+    }
+
+    [[nodiscard]] std::uint64_t free_pool_tokens() const noexcept {
+        return std::uint64_t(page_pool.free_pages()) * kPagedKVPageSize;
+    }
+    [[nodiscard]] std::uint64_t held_pool_tokens(std::uint32_t s) const noexcept {
+        return pool_pages == 0 ? 0 : std::uint64_t(page_pool.held_pages(s)) * kPagedKVPageSize;
+    }
+
     void allocate_sequences() {
         const std::uint64_t width = std::uint64_t(config.hc_count) * config.hidden_size;
         allocate_gdn_pools();
+        if (pool_pages != 0) { allocate_pool(); }
         for (std::uint32_t s = 0; s < options.sequences; ++s) {
             SequenceState sequence;
             sequence.slot = s;
@@ -2217,6 +2331,11 @@ struct Executor::Impl {
         reset_pipeline();
         drain();
         auto& sequence    = sequences.at(s);
+        if (pool_pages != 0 && page_pool.held_pages(s) != 0) {
+            // Another sequence may take the pages (and their table entries) next.
+            synchronize_ranks();
+            release_pages(sequence);
+        }
         if (std::find(verified.begin(), verified.end(), &sequence) != verified.end()) { verified.clear(); }
         sequence.position = 0;
         sequence.context  = NgramContext::sequence_start(ngram, config.eos_token_id);
@@ -2724,6 +2843,10 @@ struct Executor::Impl {
                                          std::span<NgramContext* const> contexts,
                                          std::uint32_t offset, std::size_t end,
                                          std::size_t first_segment = 0) {
+        for (const Part& part : parts) {
+            require_pages(*part.sequence, std::uint64_t(part.sequence->position) + offset +
+                                              std::uint64_t(part.count));
+        }
         const std::size_t ring = ranks.front().staging.size();
         auto task              = new_task();
         const std::size_t slot = ++staged_passes % ring;
@@ -3154,8 +3277,8 @@ struct Executor::Impl {
         return in;
     }
 
-    void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part,
-                 const AttentionInputs& in) {
+    void run_qsa(const LayerPlan& plan, std::size_t kv_index, LayerState& state, RankState& rank,
+                 const Part& part, const AttentionInputs& in) {
         const QsaPlan& a     = *plan.qsa;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
@@ -3195,14 +3318,18 @@ struct Executor::Impl {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
             ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
-        // The paged KV: device pages, or a streamed layer's host copy. A streamed layer's call of
-        // at most stream_width tokens reads its device pool once kv_stream_resolve has made the
-        // call's blocks resident there; a wider call (a prompt chunk) reads the rank's staging
-        // copy, into which it appends as well, and then drops the blocks it wrote from the pool.
+        // The paged KV: device pages (a shared KV pool's through the sequence's block table), or a
+        // streamed layer's host copy. A streamed layer's call of at most stream_width tokens reads
+        // its device pool once kv_stream_resolve has made the call's blocks resident there; a
+        // wider call (a prompt chunk) reads the rank's staging copy, into which it appends as
+        // well, and then drops the blocks it wrote from the pool.
         const auto paged_count = static_cast<std::int32_t>(pages);
-        const PagedKVLayerView cache =
-            kv_view([&](std::size_t i) { return state.kv[i].p; }, kPagedKVPageSize, paged_count,
-                    rank.block_table.p, paged_count);
+        const LayerState& planes_of = pool_pages != 0 ? pool_kv[kv_index] : state;
+        auto* const table = static_cast<std::int32_t*>(rank.block_table.p) +
+                            (pool_pages != 0 ? std::size_t(part.sequence->slot) * pages : 0);
+        const PagedKVLayerView cache = kv_view(
+            [&](std::size_t i) { return planes_of.kv[i].p; }, kPagedKVPageSize,
+            static_cast<std::int32_t>(pool_pages != 0 ? pool_pages : pages), table, paged_count);
         const bool streamed = state.map.table != nullptr;
         const bool pooled_read = streamed && t <= static_cast<std::int32_t>(stream_width);
         const Tensor v3(v.data, DType::BF16, {d, nk, t});
@@ -3547,7 +3674,7 @@ struct Executor::Impl {
                 if (plan.gdn) {
                     run_gdn(plan, i, state, rank, part);
                 } else {
-                    run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
+                    run_qsa(plan, i, state, rank, part, target_inputs(i, state, rank, part));
                 }
             }
             {
@@ -3626,6 +3753,7 @@ struct Executor::Impl {
             if (part.sequence->position + std::uint32_t(part.count) > options.max_context) {
                 throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
             }
+            require_pages(*part.sequence, part.sequence->position + std::uint32_t(part.count));
         }
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
@@ -3862,6 +3990,7 @@ struct Executor::Impl {
         if (start + n > options.max_context) {
             throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
         }
+        require_pages(sequence, std::uint64_t(start) + n);
         const std::size_t prompt = sequence.media_rope.size() / 3;
         if (prompt != 0 && start < prompt) {
             throw std::invalid_argument("qwen4_exp forward: a media prompt prefills chunk by chunk");
@@ -3975,7 +4104,7 @@ struct Executor::Impl {
                         // The span holds the sequence at its start; chunk k begins k chunks on.
                         AttentionInputs in = target_inputs(i, state, rank, part);
                         in.first           = start + std::uint32_t(k * c);
-                        run_qsa(plan, state, rank, part, in);
+                        run_qsa(plan, i, state, rank, part, in);
                     }
                     {
                         auto scope = rank.workspace->scope();
@@ -4341,7 +4470,7 @@ struct Executor::Impl {
         for (const MtpPart& part : parts) {
             SequenceState& sequence = *part.sequence;
             const Part cells{.sequence = &sequence, .column = part.column, .count = part.count};
-            run_qsa(plan, sequence.mtp, rank, cells,
+            run_qsa(plan, layers.size(), sequence.mtp, rank, cells,
                     {.positions = positions + part.column,
                      .rope      = positions + part.column,
                      .index     = nullptr,
@@ -4524,6 +4653,10 @@ struct Executor::Impl {
         draft_sequence = drafting.front();
         draft_first = drafting.front()->position - 1;
         draft_steps = static_cast<std::uint32_t>(k);
+        // The MTP layer writes its cells' KV at the steps' positions.
+        for (const SequenceState* sequence : drafting) {
+            require_pages(*sequence, std::uint64_t(sequence->position) + staged);
+        }
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(anchors, 0, positions, 0);
         if (draft_prefetch) {
@@ -5136,6 +5269,8 @@ struct Executor::Impl {
         verified_set            = ahead.set;
         const std::uint32_t k     = w - 1;
         const std::uint32_t first = sequence.position - 1;
+        // The chain's MTP cells reach position first + 2k.
+        require_pages(sequence, std::uint64_t(first) + 2 * k + 1);
         const std::uint64_t number = ++guess_posted;
         std::vector<std::int32_t> forced(tokens.begin(), tokens.end());
         std::vector<std::int32_t> positions(2 * k + 1);
@@ -5269,6 +5404,10 @@ struct Executor::Impl {
     [[nodiscard]] std::vector<ImageRegion> image_regions(const SequenceState& sequence,
                                                          const SequenceSnapshot* at,
                                                          std::uint32_t position) const {
+        if (pool_pages != 0) {
+            throw std::invalid_argument("qwen4_exp: sequence images need per-sequence KV windows, "
+                                        "not a shared KV pool");
+        }
         std::vector<ImageRegion> out;
         const std::uint64_t used =
             (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize;
@@ -5506,6 +5645,18 @@ void Executor::verify(std::span<const std::uint32_t> sequences,
 void Executor::commit(std::span<const std::uint32_t> sequences,
                       std::span<const std::uint32_t> columns) {
     impl_->commit(sequences, columns);
+}
+
+bool Executor::kv_pooled() const noexcept { return impl_->pool_pages != 0; }
+
+std::uint64_t Executor::kv_free_tokens() const noexcept { return impl_->free_pool_tokens(); }
+
+std::uint64_t Executor::kv_held_tokens(std::uint32_t sequence) const noexcept {
+    return impl_->held_pool_tokens(sequence);
+}
+
+bool Executor::reserve_kv(std::uint32_t sequence, std::uint32_t tokens) {
+    return impl_->reserve_pages(impl_->sequences.at(sequence), tokens);
 }
 
 bool Executor::pipeline_windows() const noexcept { return impl_->pipeline; }

@@ -783,6 +783,7 @@ std::string format_server_start_json(
         {"max_context", engine_options.max_context},
         {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
         {"kv_capacity", memory.kv_capacity},
+        {"kv_pool", engine_options.kv_pool_tokens},
         {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
         {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
         {"max_concurrency", engine_options.max_concurrency},

@@ -231,6 +231,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                so the stages overlap; requests with MTP decode\n"
            "                                plainly while two or more run\n"
            "  --decode-group-steps N        decode steps a group call runs, 1..64 (default 8)\n"
+           "  --kv-pool N                   Qwen3.8-Flash-Next: the requests share one KV pool\n"
+           "                                of N positions (max-context or more, fewer than\n"
+           "                                max-concurrency x max-context) instead of a\n"
+           "                                window each; every position on the GPU, no host\n"
+           "                                or disk context cache\n"
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1152,6 +1157,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             decode_group_steps_explicit               = true;
             continue;
         }
+        if (arg == "--kv-pool") {
+            const int tokens = parse_nonnegative_int(require_value("--kv-pool"), "kv-pool");
+            if (tokens == 0) { throw std::invalid_argument("--kv-pool must be positive"); }
+            options.kv_pool_tokens = static_cast<std::uint32_t>(tokens);
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1705,6 +1716,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (decode_group_steps_explicit && options.stage_pipeline.decode_groups == 0) {
         throw std::invalid_argument("--decode-group-steps requires --decode-groups");
+    }
+    // A pool's sequences give their pages back instead of keeping context-cache images.
+    if (options.kv_pool_tokens != 0) {
+        const ContextCacheOptions& cache = options.context_cache;
+        if ((host_state_slots_explicit && cache.host_state_slots != 0) ||
+            (host_kv_mib_explicit && cache.host_kv_capacity_bytes != 0) ||
+            (host_cache_budget_explicit &&
+             (cache.host_cache_auto || cache.host_cache_budget_bytes.value_or(0) != 0)) ||
+            !cache.disk_kv_path.empty()) {
+            throw std::invalid_argument("--kv-pool keeps no host or disk context cache: drop "
+                                        "--host-state-slots, --host-kv-mib, --host-cache-mib "
+                                        "and --disk-kv-path");
+        }
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
