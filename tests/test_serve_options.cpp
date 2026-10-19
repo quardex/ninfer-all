@@ -1429,6 +1429,31 @@ int main() {
                                   .concurrent_prefill &&
                               !parse({"ninfer-serve", "model.ninfer"}).concurrent_prefill,
                           "--concurrent-prefill was not an off-by-default switch");
+        {
+            // The pipeline stages' modes (Flash-Next): off by default, passed to the Engine, and
+            // refused where they cannot run.
+            const auto stages =
+                parse({"ninfer-serve", "model.ninfer", "--rank-threads", "--pipeline-windows"});
+            const ninfer::StagePipelineOptions engine = make_engine_options(stages).stage_pipeline;
+            failures += check(engine.rank_threads && engine.pipeline_windows,
+                              "the pipeline stages' modes did not reach the Engine");
+            const ninfer::StagePipelineOptions defaults =
+                parse({"ninfer-serve", "model.ninfer"}).stage_pipeline;
+            failures += check(!defaults.rank_threads && !defaults.pipeline_windows,
+                              "the pipeline stages' modes were not off by default");
+            for (const std::vector<std::string>& extra :
+                 {std::vector<std::string>{"--pipeline-windows"}}) {
+                std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+                arguments.insert(arguments.end(), extra.begin(), extra.end());
+                bool rejected = false;
+                try {
+                    (void)parse(arguments);
+                } catch (const std::invalid_argument&) { rejected = true; }
+                const std::string message = "the server accepted " + extra.front() + " " +
+                                            (extra.size() > 1 ? extra[1] : "");
+                failures += check(rejected, message.c_str());
+            }
+        }
         failures += check(parse({"ninfer-serve", "model.ninfer", "--recover-invariant-failures"})
                                   .recover_invariant_failures &&
                               !parse({"ninfer-serve", "model.ninfer"}).recover_invariant_failures,

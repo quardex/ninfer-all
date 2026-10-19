@@ -35,6 +35,7 @@
 #include <bit>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -249,6 +250,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const runtime::RopeScalingPlan rope = runtime::resolve_rope_scaling(
         options, text.max_position_embeddings, runtime::kQwen4ExpRopeScaling);
     executor.rope_yarn       = rope.yarn;
+    // How the host queues the pipeline stages' work (the executor checks the stages and experts).
+    const StagePipelineOptions& stages = options.stage_pipeline;
+    if (stages.pipeline_windows && !stages.rank_threads) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's pipeline windows run on rank threads");
+    }
+    executor.rank_threads     = stages.rank_threads;
+    executor.pipeline_windows = stages.pipeline_windows;
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
@@ -2003,6 +2011,49 @@ struct Qwen4ExpCore::Impl {
     // accepted drafts and a correction or bonus, sampled as the request samples, so the output
     // follows the target's distribution), the output policy takes what it accepts of the run, and
     // the executor commits the tokens fed up to the last of them.
+    // NINFER_QWEN4_ROUND_TIMING=1: the host's wall time of an MTP round's phases (the draft with
+    // its synchronization, the verification until the acceptance is on the host, the commit and
+    // the bookkeeping after it), printed every 100 rounds. A diagnostic of pipelined rounds.
+    struct RoundTiming {
+        double draft = 0, verify = 0, accept = 0, commit = 0, total = 0;
+        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0;
+    };
+    RoundTiming round_timing;
+    static bool round_timing_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_QWEN4_ROUND_TIMING");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    void report_round_timing() {
+        RoundTiming& t = round_timing;
+        if (t.rounds % 100 != 0) { return; }
+        const double n = double(t.rounds);
+        std::fprintf(stderr,
+                     "round timing | %llu rounds, %.2f tokens/round, %.0f%% whole windows, guesses "
+                     "%llu held %llu | ms/round: total %.2f draft %.2f verify %.2f accept %.2f "
+                     "commit %.2f\n",
+                     static_cast<unsigned long long>(t.rounds), double(t.tokens) / n,
+                     100.0 * double(t.full) / n, static_cast<unsigned long long>(t.guessed),
+                     static_cast<unsigned long long>(t.held), 1e3 * t.total / n, 1e3 * t.draft / n,
+                     1e3 * t.verify / n, 1e3 * t.accept / n, 1e3 * t.commit / n);
+        t = RoundTiming{};
+    }
+
+    // Pipeline windows (the executor's): a lone unconstrained request without logprobs, MTP drafts
+    // of the full width. A round whose verdict keeps its window whole with the guessed bonus
+    // leaves the guessed window as the next round's, already through the front ranks.
+    bool guessed_next = false;
+    std::uint32_t guessed_slot = 0;
+    std::vector<TokenId> guessed_tokens;
+    [[nodiscard]] bool pipelined_round(const std::vector<std::shared_ptr<Request>>& batch) const {
+        const auto& executor = *instance.executor;
+        return executor.pipeline_windows() && batch.size() == 1 && lookup_ngram == 0 &&
+               !mtp_controller && executor.options().draft_min_p == 0 &&
+               !batch.front()->constrained && !batch.front()->options.execution.logprobs;
+    }
+
     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch) {
         auto& executor      = *instance.executor;
         const std::size_t b = batch.size();
@@ -2012,6 +2063,14 @@ struct Qwen4ExpCore::Impl {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
         }
+        const bool pipelined  = pipelined_round(batch);
+        const bool continuing = pipelined && guessed_next && guessed_slot == batch.front()->slot &&
+                                guessed_tokens.size() == std::size_t(drafts) + 1 &&
+                                anchors.front() == guessed_tokens.front();
+        if (!continuing && executor.pipeline_windows() && executor.guess_live()) {
+            executor.drop_guess();
+        }
+        guessed_next = false;
         const auto round_start = Clock::now();
         // With --adaptive-mtp the controller picks the round's steps from each request's draft
         // survival and the round times it has measured; a new set of requests restarts its probe.
@@ -2061,7 +2120,11 @@ struct Qwen4ExpCore::Impl {
                 }
             }
         }
-        if (lookups < b) {
+        if (continuing) {
+            // The guessed window: its drafts are the guess's, a whole chain's.
+            std::copy(guessed_tokens.begin() + 1, guessed_tokens.end(), all_drafts.begin());
+            mtp_steps = steps;
+        } else if (lookups < b) {
             std::vector<std::uint32_t> mtp_sequences;
             std::vector<TokenId> mtp_anchors;
             for (std::size_t j = 0; j < b; ++j) {
@@ -2072,6 +2135,9 @@ struct Qwen4ExpCore::Impl {
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
             std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
             mtp_steps = executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            if (round_timing_enabled()) {
+                round_timing.draft += seconds(round_start, Clock::now());
+            }
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
@@ -2105,7 +2171,21 @@ struct Qwen4ExpCore::Impl {
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
-        executor.verify(sequences, tokens);
+        const auto verify_start = Clock::now();
+        if (continuing) {
+            executor.verify_guessed(tokens);
+        } else {
+            if (pipelined) { executor.guess_after_draft(); }
+            executor.verify(sequences, tokens);
+        }
+        // The guess of the window after this one goes to the front ranks while the head rank
+        // verifies this one.
+        std::vector<TokenId> guess;
+        if (pipelined && batch.front()->position + 2 * w <= max_context) {
+            guess.resize(w);
+            executor.take_guess(guess);
+            executor.verify_ahead(guess);
+        }
 
         RankBinding bind(device, executor.head_rank());
         const cudaStream_t stream = executor.head_stream();
@@ -2229,6 +2309,7 @@ struct Qwen4ExpCore::Impl {
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         instance.executor->raise_service_failure();
+        const auto accept_start = Clock::now();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
         // fed up to the last one taken.
@@ -2312,7 +2393,42 @@ struct Qwen4ExpCore::Impl {
                 ops::increment_token_counts(ids, row_counts, stream);
             }
         }
+        const auto commit_start = Clock::now();
         executor.commit(sequences, kept);
+        if (!guess.empty()) {
+            // The guess holds when the request took the whole window and its bonus was guessed.
+            // NINFER_QWEN4_PIPELINE_FORCE_MISS=1 drops every guess (a test of the shadow states).
+            static const bool force_miss = [] {
+                const char* value = std::getenv("NINFER_QWEN4_PIPELINE_FORCE_MISS");
+                return value != nullptr && value[0] == '1';
+            }();
+            const std::int32_t licensed_n = host[b * w];
+            const bool hold = !force_miss && !failed.front() && active(batch.front()) &&
+                              kept.front() == w && licensed_n == columns &&
+                              host[w - 1] == guess.front();
+            if (hold) {
+                guessed_next   = true;
+                guessed_slot   = batch.front()->slot;
+                guessed_tokens = std::move(guess);
+                if (round_timing_enabled()) { round_timing.held += 1; }
+            } else {
+                executor.drop_guess();
+            }
+            if (round_timing_enabled()) { round_timing.guessed += 1; }
+        }
+        if (round_timing_enabled()) {
+            const auto now = Clock::now();
+            round_timing.verify += seconds(verify_start, accept_start);
+            round_timing.accept += seconds(accept_start, commit_start);
+            round_timing.commit += seconds(commit_start, now);
+            round_timing.total += seconds(round_start, now);
+            round_timing.rounds += 1;
+            for (std::size_t j = 0; j < b; ++j) {
+                round_timing.tokens += kept[j];
+                if (kept[j] == w) { round_timing.full += 1; }
+            }
+            report_round_timing();
+        }
         // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
         if (mtp_controller && lookups == 0) {
             mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,

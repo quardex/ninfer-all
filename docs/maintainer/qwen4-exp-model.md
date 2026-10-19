@@ -43,9 +43,20 @@ Built and kept experimental, not published:
 - the HF-source Q4/Q5 recipe (`qwen3_8_flash_next`), whose full-model quality is unmeasured, and the
   FP8 n-gram table, rejected for its 80% larger rows.
 
+Over pipeline stages (`--devices`) the executor queues each pass's segments stage after stage from
+the Engine's thread, and the head (final mixer, head, sampling and the MTP block) sits on the last
+stage. Two opt-in modes for device experts change how the stages' work is queued, not what it
+computes (`EngineOptions::stage_pipeline`; the guide's
+[stages without peer access](../qwen3-8-flash-next.md#stages-without-peer-access-rank-threads-pipeline-windows)):
+rank threads (a host thread per stage, the stack handed on through pinned rings counted per
+boundary) and pipeline windows (the front stages run the window the MTP block guesses will
+follow, from shadow states, while the head verifies). A rank thread's failure fails the Engine
+(`RankThreadsFailed`).
+
 Not supported: DFlash or DFlash2 (no drafter exists for this model; PixelML's NVFP4 DFlash drafter
 is a research artifact for vLLM), n-gram copy proposals, `--lm-head-draft`,
-`--mtp-attention-window`, disk residency of native banks. The Windows paths have not been run.
+`--mtp-attention-window`, disk residency of native banks. On Windows only the device-expert
+pipeline over WDDM GPUs (no peer access) with the modes above has been run.
 
 ---
 
