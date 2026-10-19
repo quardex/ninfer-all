@@ -250,6 +250,32 @@ void cache_test(const char* artifact) {
     std::cout << "disk cache: " << files << " images; failures=" << failures << '\n';
 }
 
+// Rank threads and pipeline windows queue the stages' work differently and compute the same: every
+// request generates the host-ordered engine's tokens at the same draft count, a lone greedy one
+// through pipeline windows, a structured one (which takes no windows) on the rank threads alone.
+void stage_modes_test(const char* artifact) {
+    const auto o = options(artifact, 2);
+    const auto all = cases();
+    const std::vector<ninfer::RequestOptions> requests{request(256), all[4], all[6]};
+    std::vector<std::vector<ninfer::TokenId>> host_ordered;
+    {
+        ninfer::Engine engine(o);
+        for (const auto& r : requests) {
+            host_ordered.push_back(engine.generate(engine.prepare(prompt()), r).generated_token_ids);
+        }
+    }
+    auto modes                            = o;
+    modes.stage_pipeline.rank_threads     = true;
+    modes.stage_pipeline.pipeline_windows = true;
+    ninfer::Engine engine(modes);
+    for (std::size_t c = 0; c < requests.size(); ++c) {
+        const auto result = engine.generate(engine.prepare(prompt()), requests[c]);
+        check(result.generated_token_ids == host_ordered[c],
+              "rank threads and pipeline windows keep request " + std::to_string(c) + "'s tokens");
+    }
+    std::cout << "STAGE_MODES failures=" << failures << '\n';
+}
+
 void ngram_cache_test(const char* artifact) {
     const auto input = tokens(700, 19); // two prefill chunks; identical shape in every mode
     for (const auto drafts : {0U, 4U}) {
@@ -510,6 +536,11 @@ int run_test() {
         cache_test(artifact);
         return failures ? 1 : 0;
     }
+    if (const char* stages_only = std::getenv("NINFER_FLASH_NEXT_STAGES_ONLY");
+        stages_only && std::string_view(stages_only) == "1") {
+        stage_modes_test(artifact);
+        return failures ? 1 : 0;
+    }
     auto requests = cases();
     std::vector<ninfer::GenerationResult> reference;
     {
@@ -646,6 +677,7 @@ int run_test() {
         std::cout << "MTP K=" << k << " rounds=" << rounds << " failures=" << failures << '\n';
     }
     cache_test(artifact);
+    stage_modes_test(artifact);
     std::cout << "ENGINE_QUALIFICATION target_differences=" << target_differences
               << " batch_differences=" << batch_differences << " failures=" << failures << '\n';
     return failures ? 1 : 0;

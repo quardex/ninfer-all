@@ -645,6 +645,53 @@ draft-chain graph and each width its own verification graph, captured at their s
 - A pass whose layers may wait on the device for their missing experts ends synchronized: CUDA
   loads a kernel lazily at its first launch, a load may wait for the device to go idle, and a
   launch during such a wait would deadlock with the service it waits for.
+- A split model whose head stage has no peer access to stage 0 looks up its MTP cells' token
+  embeddings on the head stage from a copy of the table's payload in mapped pinned host memory (a
+  row of the bus per cell; 322 MiB for the IQ3_S table) instead of asking stage 0 and copying the
+  rows back, so the draft chain stays on one device and replays its graph there. With peer access
+  between the two the lookup stays on stage 0.
+
+### Stages without peer access (rank threads, pipeline windows)
+
+Between GPUs without peer access (every GeForce pair under Windows/WDDM), a stream that waits on
+another device's event, or a staged peer copy, blocks the host thread that queues it until the other
+device gets there. One host thread queuing every stage therefore walks each pass through the
+pipeline at device speed, and the stages take turns. Two opt-in modes of `ninfer-serve`
+(`EngineOptions::stage_pipeline`), for pipeline stages with device experts, change that; none of
+them changes an output:
+
+- **Rank threads** (`--rank-threads`). The host thread prepares a pass's inputs
+  (positions, n-gram rows) into a staging entry and posts it; each stage's own thread uploads them,
+  waits on the host for its stack from the stage before (the only thread that blocks), runs its
+  segments and hands the stack on through pinned host buffers counted per boundary. Prompt chunks
+  then fill every stage, and the head stage's MTP catch-up takes the pass's embeddings from host
+  memory instead of a round trip to stage 0 that would order stage 0's next chunk after the head.
+  Calls that read results or state first wait until the threads have queued every posted pass.
+- **Pipeline windows** (`--pipeline-windows`, with rank threads, MTP drafts and CUDA Graphs). A round
+  takes them while one request decodes, without logprobs, a grammar, `--lookup-ngram`,
+  `--adaptive-mtp` or a draft probability floor (`--draft-min-p` above 0, which the Engine also
+  sets by itself for host or disk experts); every other round verifies as before. A round's
+  verification goes to the rank threads, and before
+  it the head stage runs the MTP chain on past the round's drafts: the bonus token the window would
+  end with if it were kept whole, and the drafts after it. The front stages run that guessed window
+  at once, while the head stage verifies the current one, from shadow states: a second slot of
+  each Gated DeltaNet pool and copies of the indexer tails and PLE histories, advanced over the
+  window in flight as if it were kept whole (the fold of a commit into the shadow slot), with a
+  second set of replay records so the window in flight can still commit any prefix. When the verdict
+  keeps the window whole with the guessed bonus, the head stage completes the guessed window from
+  the front stages' stack and the next guess chain runs through its tokens; otherwise the guess is
+  dropped and the next round drafts as before. Commits run on the rank threads too. Every token is
+  still the verification's, and the weighted expert outputs are summed in fixed point, so the output
+  is the serial loop's byte for byte.
+
+A rank thread's failure stops the Engine with every request it holds (`RankThreadsFailed`): the
+passes queued after it were skipped, so no sequence's state can be trusted.
+
+Diagnostics: `NINFER_QWEN4_PIPELINE_FORCE_MISS=1` drops every guess (the shadow work still runs), a
+test of the shadow states; `NINFER_QWEN4_ROUND_TIMING=1` prints the host's time per MTP round phase
+every 100 rounds (with the guesses made and held), and for host-ordered verifications each stage's
+device time in a window; `NINFER_QWEN4_STAGING_RING=N` sets the host's staging ring (default the
+stages plus one; 1 waits for the previous pass on every stage), for A/B measurements.
 
 ## Measurements
 
@@ -912,6 +959,78 @@ of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than 
 With host experts a verification's four columns route to up to four times as many experts, each
 missing one crossing the bus, so three drafts gained about 12% here; after the October 9
 host-expert work three drafts decode 90-123 tok/s against 87-94 plain (table above).
+
+### Stages without peer access on Windows
+
+These modes were measured on master f6ec88bb with the same code; their port to the current master
+is not measured yet. IQ3_S with the IQ4_NL table read from its file, device experts, Windows 11
+(WDDM, no peer access between any pair, every card on PCIe x1 risers), CUDA 12.8 build for `75;86`,
+the built-in device profiles. A is a TITAN RTX + four RTX 3060 12 GB (`--stage-layers 8,8,8,8,16`,
+the TITAN last with the head, rk8v4 KV); B is two RTX 3060 + a TITAN RTX + an RTX 3090 (`8,8,17,15`
+with int8 KV, `8,8,16,16` with rk8v4). The RTX 3060s were held at 1500-2100 MHz: without that floor
+they sank to 210 MHz between their stages' bursts, and A decoded a chat at 9.6 tok/s, each 3060's
+share of a verification taking 60-77 ms instead of 8. A 206,053-token prompt (the repository's
+docs), 262,144-token context, 2,048-token chunks, greedy, 512 new tokens, one run per row:
+
+| Layout, KV | Mode | Prefill tok/s | Decode tok/s |
+|---|---|---:|---:|
+| A, rk8v4 | host-ordered, MTP3 | 516 | 37.1 |
+| A, rk8v4 | rank threads, MTP2 | 1,720 | 36.5 |
+| A, rk8v4 | rank threads + pipeline windows, MTP2 (26% of guesses held) | 1,720 | 45.7 |
+| A, rk8v4 | rank threads + pipeline windows, MTP3 (20% held) | 1,720 | 40.6 |
+| B, rk8v4 | host-ordered, MTP3 | 683 | 42.2 |
+| B, rk8v4 | rank threads + pipeline windows, MTP2 (32% held) | 1,640 | 60.4 |
+| B, int8 | rank threads, MTP2 | 1,590 | 46.3 |
+| B, int8 | rank threads + pipeline windows, MTP2 (31% held) | 1,590 | 62.2 |
+
+Every pipeline-window run generated the host-ordered run's text at the same draft count. With every
+guess dropped (`NINFER_QWEN4_PIPELINE_FORCE_MISS=1`) B with rk8v4 and MTP2 still decoded at 53.4
+tok/s against 43.8 host-ordered, but the verifications and commits on the rank threads are not that
+gain: a build that posted no guesses decoded as without pipeline windows. Without guesses the TITAN
+RTX and the RTX 3090 averaged 1,380-1,530 MHz while decoding, against 1,840-1,880 with them: the
+guessed windows' work, kept or dropped, holds those cards at their boost clocks, the likely source
+of most of the gain. A round of B (rk8v4, MTP2) took 45.5 ms host-ordered (draft 4.8, verification
+39.9) and 33.9 ms with pipeline windows. Through `ninfer-serve` (one slot of 262,144 tokens, a
+15-token chat prompt, MTP2) A decoded at 65.1 tok/s against 49.3 and B (int8) at 92.0 against 63.0,
+with the same text; a sampled request (temperature 0.7), a request cancelled after 3 s and three
+requests in a row then ran normally. The head stage's embedding copy alone took B's draft chain
+from 8.5 to 6.5 ms a round (MTP3).
+
+A with rk8v4, each row adding one mode to the row before, a 33,009-token prompt and a 1,024-token
+chat through `ninfer-serve`; every text was the first row's:
+
+| Modes | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| none, MTP3, without the head stage's embedding copy | 573 | 49.9 |
+| the head stage's embedding copy | 703 | 51.3 |
+| rank threads | 1,644 | 51.3 |
+| pipeline windows, MTP2 | 1,641 | 67.3 |
+
+What each mode costs in GPU power on A, one server per row adding one mode to the row before: the
+33K prompt with one output token (prefill) and a 1,024-token chat (decode), nvidia-smi sampling every
+card each 100 ms; the energy is the cards' mean power over the request's wall time, times that time,
+per token. Master's rows are master as pulled.
+
+| A | Prefill tok/s | W | J/token | Decode tok/s | W | J/token |
+|---|---:|---:|---:|---:|---:|---:|
+| master, plain decode | 761 | 384 | 0.505 | 34.7 | 254 | 7.41 |
+| master, MTP3 | 573 | 345 | 0.603 | 48.0 | 278 | 5.89 |
+| the head stage's embedding copy | 702 | 377 | 0.539 | 49.2 | 280 | 5.79 |
+| rank threads | 1,653 | 549 | 0.333 | 49.0 | 274 | 5.69 |
+| MTP2 | 1,650 | 550 | 0.335 | 47.2 | 258 | 5.58 |
+| pipeline windows | 1,652 | 551 | 0.335 | 67.6 | 423 | 6.43 |
+
+Rank threads run the same passes, only at once: prefill 2.4 times as fast for 1.46 times the
+power, 38% less energy a prompt token. Pipeline windows are the one mode that computes what may be
+thrown away: 197 of the 437 guessed windows of A's chat held (45%), 203 of 428 on B (47%), and the
+dropped ones cost 15% (A) and 27% (B) more energy a generated token for 43% and 57% more speed.
+
+Against master f6ec88bb in its own defaults (`--spec none`, one request at a time), a build of these
+modes as an API runs them (rank threads, pipeline windows, MTP2; with decode groups of four, a KV
+pool the slots shared and a message checkpoint, submitted separately) gave master's text byte for
+byte on all 17 requests, on A and on B, at 1,024-token chunks, greedy and without logprobs: the 206K
+prompt, the 33K prompt, a code prompt and two 1,024-token chats one at a time; four turns of an agent
+session over a 67K docs prompt; four chats at once; and the 33K prompt beside three chats.
 
 ### Hyper-connections in Q8_0
 
