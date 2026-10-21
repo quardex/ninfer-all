@@ -255,8 +255,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (stages.pipeline_windows && !stages.rank_threads) {
         throw std::invalid_argument("Qwen3.8-Flash-Next's pipeline windows run on rank threads");
     }
-    executor.rank_threads     = stages.rank_threads;
-    executor.pipeline_windows = stages.pipeline_windows;
+    if (!(stages.pipeline_guess_min_p >= 0 && stages.pipeline_guess_min_p < 1) ||
+        (stages.pipeline_guess_min_p > 0 && !stages.pipeline_windows)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's guess floor is a probability below 1 "
+                                    "for pipeline windows");
+    }
+    executor.rank_threads         = stages.rank_threads;
+    executor.pipeline_windows     = stages.pipeline_windows;
+    executor.pipeline_guess_min_p = stages.pipeline_guess_min_p;
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
@@ -2016,7 +2022,7 @@ struct Qwen4ExpCore::Impl {
     // the bookkeeping after it), printed every 100 rounds. A diagnostic of pipelined rounds.
     struct RoundTiming {
         double draft = 0, verify = 0, accept = 0, commit = 0, total = 0;
-        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0;
+        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0, skipped = 0;
     };
     RoundTiming round_timing;
     static bool round_timing_enabled() {
@@ -2032,12 +2038,14 @@ struct Qwen4ExpCore::Impl {
         const double n = double(t.rounds);
         std::fprintf(stderr,
                      "round timing | %llu rounds, %.2f tokens/round, %.0f%% whole windows, guesses "
-                     "%llu held %llu | ms/round: total %.2f draft %.2f verify %.2f accept %.2f "
-                     "commit %.2f\n",
+                     "%llu held %llu not posted %llu | ms/round: total %.2f draft %.2f verify %.2f "
+                     "accept %.2f commit %.2f\n",
                      static_cast<unsigned long long>(t.rounds), double(t.tokens) / n,
                      100.0 * double(t.full) / n, static_cast<unsigned long long>(t.guessed),
-                     static_cast<unsigned long long>(t.held), 1e3 * t.total / n, 1e3 * t.draft / n,
-                     1e3 * t.verify / n, 1e3 * t.accept / n, 1e3 * t.commit / n);
+                     static_cast<unsigned long long>(t.held),
+                     static_cast<unsigned long long>(t.skipped), 1e3 * t.total / n,
+                     1e3 * t.draft / n, 1e3 * t.verify / n, 1e3 * t.accept / n,
+                     1e3 * t.commit / n);
         t = RoundTiming{};
     }
 
@@ -2179,12 +2187,18 @@ struct Qwen4ExpCore::Impl {
             executor.verify(sequences, tokens);
         }
         // The guess of the window after this one goes to the front ranks while the head rank
-        // verifies this one.
+        // verifies this one, unless the MTP block's estimate of it holding is below the floor
+        // (--pipeline-guess-min-p).
         std::vector<TokenId> guess;
         if (pipelined && batch.front()->position + 2 * w <= max_context) {
             guess.resize(w);
             executor.take_guess(guess);
-            executor.verify_ahead(guess);
+            if (executor.guess_worth_posting()) {
+                executor.verify_ahead(guess);
+            } else {
+                guess.clear();
+                if (round_timing_enabled()) { round_timing.skipped += 1; }
+            }
         }
 
         RankBinding bind(device, executor.head_rank());

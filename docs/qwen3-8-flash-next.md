@@ -683,7 +683,10 @@ them changes an output:
   the front stages' stack and the next guess chain runs through its tokens; otherwise the guess is
   dropped and the next round drafts as before. Commits run on the rank threads too. Every token is
   still the verification's, and the weighted expert outputs are summed in fixed point, so the output
-  is the serial loop's byte for byte.
+  is the serial loop's byte for byte. `--pipeline-guess-min-p P` posts only a guess whose
+  estimate, the MTP block's probabilities of the window in flight's drafts and of the guessed bonus
+  multiplied, reaches P: a dropped guess costs the front stages a window of work, a guess not posted
+  only the head stage's draft chain.
 
 A rank thread's failure stops the Engine with every request it holds (`RankThreadsFailed`): the
 passes queued after it were skipped, so no sequence's state can be trusted.
@@ -1025,6 +1028,30 @@ Rank threads run the same passes, only at once: prefill 2.4 times as fast for 1.
 power, 38% less energy a prompt token. Pipeline windows are the one mode that computes what may be
 thrown away: 197 of the 437 guessed windows of A's chat held (45%), 203 of 428 on B (47%), and the
 dropped ones cost 15% (A) and 27% (B) more energy a generated token for 43% and 57% more speed.
+
+Which guesses pipeline windows post (`--pipeline-guess-min-p`), one request at a time through
+`ninfer-serve` at 1,024-token chunks: the 206K docs prompt with its question replaced by one asking
+for a long answer (206,078 tokens), greedy, up to 2,048 new tokens (A answered in 1,961, B in
+1,711), one run per row, the decode's power sampled as above with the RTX 3060s floored, and in the
+last column with every card held at 1,500 MHz (`--gpu-clock-floor 1500`). Held / posted counts the
+guesses of the rounds the server printed (900 on A, 800 on B, a 64-token warm-up's included).
+
+| Layout, KV | Guesses posted | Held / posted | Decode tok/s | W | J/token | Every card floored: tok/s, W, J/token |
+|---|---|---:|---:|---:|---:|---:|
+| A, rk8v4 | no pipeline windows | | 39.0 | 283 | 7.26 | 39.6, 287, 7.23 |
+| A, rk8v4 | p >= 0.5 | 274 / 451 | 47.4 | 399 | 8.40 | 46.3, 396, 8.55 |
+| A, rk8v4 | p >= 0.25 | 324 / 701 | 50.9 | 426 | 8.36 | |
+| A, rk8v4 | every one | 332 / 900 | 52.3 | 440 | 8.41 | 51.2, 437, 8.52 |
+| B, int8 | no pipeline windows | | 44.9 | 311 | 6.94 | 46.1, 321, 6.94 |
+| B, int8 | p >= 0.5 | 233 / 391 | 62.3 | 560 | 8.99 | 62.3, 560, 8.99 |
+| B, int8 | p >= 0.25 | 271 / 624 | 64.9 | 598 | 9.21 | |
+| B, int8 | every one | 280 / 800 | 67.8 | 640 | 9.43 | 68.3, 648, 9.47 |
+
+Every run generated the text of the run without pipeline windows. A floor of 0.5 posted half the
+guesses, 60-61% of them held against 35-37% of every guess, and gave up about a sixth of the held
+ones. On A it drew 9% less power for 9-10% less speed than every guess, about the same energy a
+token; on B 12-14% less power for 8-9% less speed, 5% less energy a token. Over the whole request
+every guess cost 3-5% more energy and saved 10-13 s.
 
 Against master f6ec88bb in its own defaults (`--spec none`, one request at a time), a build of these
 modes as an API runs them (rank threads, pipeline windows, MTP2; with decode groups of four, a KV

@@ -222,6 +222,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                run the guessed next one (a lone request without\n"
            "                                logprobs, a grammar or --draft-min-p); same\n"
            "                                outputs\n"
+           "  --pipeline-guess-min-p P      with --pipeline-windows: post only a guess the MTP\n"
+           "                                block estimates to hold with probability P or\n"
+           "                                more, 0..1 (default 0: every guess); fewer\n"
+           "                                windows dropped, less power, less speed\n"
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1116,6 +1120,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.stage_pipeline.pipeline_windows = true;
             continue;
         }
+        if (arg == "--pipeline-guess-min-p") {
+            const float p = parse_float_in(require_value("--pipeline-guess-min-p"),
+                                           "pipeline-guess-min-p", 0.0F, 1.0F);
+            if (!(p < 1.0F)) { throw std::invalid_argument("--pipeline-guess-min-p is below 1"); }
+            options.stage_pipeline.pipeline_guess_min_p = p;
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1662,6 +1673,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.stage_pipeline.pipeline_windows && !options.stage_pipeline.rank_threads) {
         throw std::invalid_argument("--pipeline-windows requires --rank-threads");
+    }
+    if (options.stage_pipeline.pipeline_guess_min_p > 0 &&
+        !options.stage_pipeline.pipeline_windows) {
+        throw std::invalid_argument("--pipeline-guess-min-p requires --pipeline-windows");
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
