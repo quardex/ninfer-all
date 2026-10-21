@@ -20,8 +20,8 @@ std::uint16_t load16(const std::uint8_t* p) noexcept {
     return value;
 }
 
-// The vector F16C form: MSVC does not declare the scalar _cvtsh_ss.
 float half(std::uint16_t bits) noexcept {
+    // MSVC exposes the vector F16C conversion, with the same low-lane result.
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
