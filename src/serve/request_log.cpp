@@ -820,6 +820,7 @@ std::string format_server_start_json(
         {"pipeline_guess_min_p", engine_options.stage_pipeline.pipeline_guess_min_p},
         {"decode_groups", engine_options.stage_pipeline.decode_groups},
         {"decode_group_steps", engine_options.stage_pipeline.decode_group_steps},
+        {"message_checkpoint", engine_options.message_checkpoint},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
         {"model_suspend", engine_options.suspend.enabled},
