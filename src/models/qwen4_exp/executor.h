@@ -87,6 +87,9 @@ struct ExecutorOptions {
     // Graphs, the front stages running the guessed next window while the head verifies one.
     bool rank_threads     = false;
     bool pipeline_windows = false;
+    // Pipeline windows post only a guess the MTP block estimates to hold with at least this
+    // probability (0: every guess).
+    float pipeline_guess_min_p = 0;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -249,6 +252,10 @@ public:
     // The last guess: the bonus token the window in flight would end with if kept whole, then
     // the drafts after it (draft_tokens() + 1 tokens). Waits for the head rank's chain.
     void take_guess(std::span<std::int32_t> out);
+    // After take_guess(): whether to post the guess (verify_ahead()). Always, unless the MTP
+    // block's own estimate of the guess holding (the window in flight's drafts and the guessed
+    // bonus all right) stays below ExecutorOptions::pipeline_guess_min_p.
+    [[nodiscard]] bool guess_worth_posting() const noexcept;
     // The front ranks run `tokens` (a guess) as the window after the one in flight.
     void verify_ahead(std::span<const std::int32_t> tokens);
     [[nodiscard]] bool guess_live() const noexcept;
