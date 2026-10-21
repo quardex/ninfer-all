@@ -218,6 +218,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
+| `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
@@ -1121,8 +1122,8 @@ decoded at 1,515-1,531 MHz without guesses and the RTX 3090 at 1,522, against 1,
 Windows past the native 262,144 positions, the same configuration with every guess and only the RTX
 3060s held at their floor. Each layout's slots, KV format and pool stayed, with two layers moved off
 its fullest card (A `9,9,8,8,14`, B `8,9,18,13`), and the window stepped down by 32,768 from an
-estimate until the warm-up, the 206K prompt and a prompt filling the window all ran. Flash-Next
-has no YaRN, so positions past 262,144 rotate unscaled: these are speeds and memory, not answers.
+estimate until the warm-up, the 206K prompt and a prompt filling the window all ran. These runs
+were without `--rope-yarn`, so positions past 262,144 rotated unscaled: speeds and memory, not answers.
 The long prompt is the docs prompt with the repository's sources appended:
 
 | Layout, KV | Window | Prompt | Prefill tok/s | Decode tok/s | MTP accepted |
@@ -1140,6 +1141,17 @@ Each sequence's workspace grows with the window (an RTX 3060 stage's from 495 Mi
 848 MiB at 622,592) beside its pooled indexer keys and the shared KV. At the windows that ran, the
 TITAN RTX held 23,384 MiB on A and 24,127 MiB of 24,576 on B, and reached 87 °C over the long
 prefills. The moved layers changed the 206K texts against the original splits on both layouts.
+
+The same windows with `--rope-yarn` (factor 2.25 on A, 2.047 on B) answered a 516,591-token prompt of
+the docs and sources holding two notes, one near token 100,000 and one past 450,000, asked for before
+a long report. A gave both notes and prefilled at 1,461 tok/s, decoding the report at 42.6 tok/s (MTP
+accepted 57.0%); B gave both at 1,276 and 56.9 tok/s (58.8%), on a build whose indexer chose the
+rotation at run time. Without YaRN A gave both notes as well (1,457 and 41.5 tok/s, 56.5%), so this
+retrieval does not separate the two. At the native window without YaRN the build gave stage 66's
+206K texts on A and B byte for byte. The build that chose the rotation at run time in the indexer
+kernels had not, though its unscaled arithmetic read the same: both texts left stage 66's at the
+same place, about 240 characters in. So the kernels take YaRN as a template parameter, and their
+unscaled instantiation is the original code.
 
 ### Hyper-connections in Q8_0
 
