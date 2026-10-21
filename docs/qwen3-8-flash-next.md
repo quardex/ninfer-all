@@ -467,7 +467,12 @@ snapshot of its recurrent state where the prompt's last user turn closes (or at 
 when the template marks no turn), 74 MiB on the device: a later prompt that continues what the
 sequence holds resumes from its live state, and one that repeats the prompt up to that point (the
 next turn of a chat, which renders the previous answer without its reasoning) resumes from the
-snapshot.
+snapshot. A prompt of 8,192 tokens or more to that point keeps a second snapshot, where its last
+message before it starts (when that lies past half of 8,192): agent clients rewrite that message in
+the next turn's prompt (Cline-family clients drop an environment block from it), which breaks the
+turn closure's prefix, and that prompt resumes from the message's start instead ("long anchor" in
+the request log). Each costs another 74 MiB on the device, taken at the sequence's first such
+prompt.
 Either way only the new tokens are prefilled; the response's prompt summary reports how many were
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
