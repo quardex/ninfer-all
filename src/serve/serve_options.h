@@ -77,6 +77,7 @@ struct ServeOptions {
     // Flash-Next: --rank-threads, --pipeline-windows, --decode-groups, --decode-group-steps.
     StagePipelineOptions stage_pipeline;
     std::uint32_t kv_pool_tokens = 0;                   // Flash-Next: --kv-pool
+    bool message_checkpoint = false;                    // Flash-Next: --message-checkpoint
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
