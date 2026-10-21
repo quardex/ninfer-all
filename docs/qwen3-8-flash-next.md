@@ -220,6 +220,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--kv-pool N` | (ninfer-serve) the sequences share one KV pool of `N` positions instead of a window each ([the context cache](#sequences-kv-and-the-context-cache)); off by default |
 | `--message-checkpoint` | (ninfer-serve) a long prompt also keeps its state before its last message, for agent clients that rewrite that message in the next turn ([the context cache](#sequences-kv-and-the-context-cache)); off by default |
+| `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
