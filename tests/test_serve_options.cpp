@@ -1429,6 +1429,22 @@ int main() {
                                   .concurrent_prefill &&
                               !parse({"ninfer-serve", "model.ninfer"}).concurrent_prefill,
                           "--concurrent-prefill was not an off-by-default switch");
+        {
+            const auto checkpoint =
+                parse({"ninfer-serve", "model.ninfer", "--message-checkpoint"});
+            failures += check(checkpoint.message_checkpoint &&
+                                  make_engine_options(checkpoint).message_checkpoint &&
+                                  !parse({"ninfer-serve", "model.ninfer"}).message_checkpoint,
+                              "--message-checkpoint was not an off-by-default switch the Engine "
+                              "receives");
+            bool without_reuse_rejected = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--message-checkpoint",
+                             "--no-prefix-reuse"});
+            } catch (const std::invalid_argument&) { without_reuse_rejected = true; }
+            failures += check(without_reuse_rejected,
+                              "--message-checkpoint with --no-prefix-reuse was accepted");
+        }
         failures += check(parse({"ninfer-serve", "model.ninfer", "--recover-invariant-failures"})
                                   .recover_invariant_failures &&
                               !parse({"ninfer-serve", "model.ninfer"}).recover_invariant_failures,

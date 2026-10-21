@@ -619,6 +619,12 @@ struct EngineOptions {
     // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
     // disk experts, every position with device experts; 0 keeps every position.
     std::optional<std::uint32_t> kv_resident_positions;
+    // Qwen3.8-Flash-Next only, with the context cache: a prompt of at least 8,192 tokens also
+    // keeps a snapshot at the last prompt chunk boundary before its last message, where the next
+    // prompt resumes when it rewrote that message (as agent clients rewrite the last user
+    // message's environment block). Each sequence holds a second snapshot of its recurrent state
+    // for it; with host or disk experts the expert cache leaves room for it at startup.
+    bool message_checkpoint = false;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor

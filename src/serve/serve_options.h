@@ -74,6 +74,7 @@ struct ServeOptions {
     HybridExpertOptions hybrid_experts;
     NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
+    bool message_checkpoint = false;                    // Flash-Next: --message-checkpoint
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;

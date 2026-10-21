@@ -814,6 +814,7 @@ std::string format_server_start_json(
         {"rope", rope_json(load.rope)},
         {"structured_output", engine_options.structured_output},
         {"concurrent_prefill", engine_options.concurrent_prefill},
+        {"message_checkpoint", engine_options.message_checkpoint},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
         {"model_suspend", engine_options.suspend.enabled},

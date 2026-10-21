@@ -250,6 +250,70 @@ void cache_test(const char* artifact) {
     std::cout << "disk cache: " << files << " images; failures=" << failures << '\n';
 }
 
+// --message-checkpoint: an agent client's next prompt rewrites the last user message of the one
+// before (it drops an environment block), which breaks the live state's and the turn closure's
+// prefixes. The sequence resumes from its snapshot at the last prompt chunk boundary before that
+// message, on the chunk grid of a prefill from position 0, so it generates what a cold prefill of
+// the rewritten prompt generates, token for token; without the option the prompt reuses nothing.
+void message_checkpoint_test(const char* artifact) {
+    std::string notes;
+    for (int i = 0; notes.size() < 48000; ++i) {
+        notes += "Note " + std::to_string(i) + ": shelf " + std::to_string(i * 37 % 101) +
+                 " holds " + std::to_string(i * 53 % 997) + " boxes of part " +
+                 std::to_string(1000 + i * 7) + ".\n";
+    }
+    const auto chat = [&](const std::string& last) {
+        ninfer::PromptInput input;
+        input.messages.push_back(ninfer::ChatMessage{
+            .role  = ninfer::ChatRole::System,
+            .parts = {ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = notes}}});
+        input.messages.push_back(ninfer::ChatMessage{
+            .role  = ninfer::ChatRole::User,
+            .parts = {ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = last}}});
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto question = std::string("How many boxes does shelf 12 hold? List the notes.");
+    const auto first     = chat("<environment>cwd: /work; time: 10:00</environment>\n" + question);
+    const auto rewritten = chat(question);
+    auto o = options(artifact, 4);
+    o.max_context     = 32768;
+    o.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(32768);
+    o.max_concurrency = 1;
+    auto r = request(64);
+    r.execution.allow_prefix_reuse = true;
+    std::vector<ninfer::TokenId> cold;
+    {
+        ninfer::Engine engine(o);
+        const auto result = engine.generate(engine.prepare(rewritten), request(64));
+        cold = result.generated_token_ids;
+        check(result.prompt.prompt_tokens > 8192, "the checkpoint prompt is long enough");
+    }
+    auto cached = o;
+    cached.context_cache.enabled = true;
+    {
+        ninfer::Engine engine(cached);
+        (void)engine.generate(engine.prepare(first), r);
+        const auto plain = engine.generate(engine.prepare(rewritten), r);
+        check(plain.reused_prompt_tokens == 0,
+              "without the message checkpoint the rewritten prompt reuses nothing");
+    }
+    cached.message_checkpoint = true;
+    {
+        ninfer::Engine engine(cached);
+        (void)engine.generate(engine.prepare(first), r);
+        const auto resumed = engine.generate(engine.prepare(rewritten), r);
+        check(resumed.prefix_reuse_path == ninfer::PrefixReusePath::PrivateLongAnchor &&
+                  resumed.reused_prompt_tokens >= 4096 &&
+                  resumed.reused_prompt_tokens % o.prefill_chunk == 0,
+              "the rewritten prompt resumes from the message checkpoint on the chunk grid");
+        check(resumed.generated_token_ids == cold,
+              "a prompt resumed from the message checkpoint generates what a cold prefill does");
+        std::cout << "MESSAGE_CHECKPOINT reused=" << resumed.reused_prompt_tokens
+                  << " equals_cold=" << (resumed.generated_token_ids == cold) << '\n';
+    }
+}
+
 void ngram_cache_test(const char* artifact) {
     const auto input = tokens(700, 19); // two prefill chunks; identical shape in every mode
     for (const auto drafts : {0U, 4U}) {
@@ -510,6 +574,11 @@ int run_test() {
         cache_test(artifact);
         return failures ? 1 : 0;
     }
+    if (const char* checkpoint_only = std::getenv("NINFER_FLASH_NEXT_CHECKPOINT_ONLY");
+        checkpoint_only && std::string_view(checkpoint_only) == "1") {
+        message_checkpoint_test(artifact);
+        return failures ? 1 : 0;
+    }
     auto requests = cases();
     std::vector<ninfer::GenerationResult> reference;
     {
@@ -646,6 +715,7 @@ int run_test() {
         std::cout << "MTP K=" << k << " rounds=" << rounds << " failures=" << failures << '\n';
     }
     cache_test(artifact);
+    message_checkpoint_test(artifact);
     std::cout << "ENGINE_QUALIFICATION target_differences=" << target_differences
               << " batch_differences=" << batch_differences << " failures=" << failures << '\n';
     return failures ? 1 : 0;
