@@ -20,6 +20,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/types.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/hybrid_experts.h"
@@ -96,6 +97,9 @@ struct ExecutorOptions {
     // Pipeline windows post only a guess the MTP block estimates to hold with at least this
     // probability (0: every guess).
     float pipeline_guess_min_p = 0;
+    // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
+    // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
+    ops::RopeYarn rope_yarn;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
