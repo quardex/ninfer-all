@@ -681,7 +681,12 @@ that:
   dropped and the next round drafts as before. Commits run on the rank threads too. Every token is
   still the verification's, and the weighted expert outputs are summed in fixed point, so the output
   is the serial loop's byte for byte. `NINFER_QWEN4_PIPELINE_FORCE_MISS=1` drops every guess (the
-  shadow work still runs), a test of the shadow states.
+  shadow work still runs), a test of the shadow states. `NINFER_QWEN4_PIPELINE_GUESS` sets which
+  guesses are posted: unset or `on` every one; `off` none, the verifications and commits still on
+  the rank threads; a probability p between 0 and 1 a guess whose estimate - the MTP block's
+  probabilities of the window in flight's drafts and of the guessed bonus, multiplied - reaches p.
+  A dropped guess costs the front ranks a window of work; a guess not posted costs only the head
+  rank's chain.
 - **Decode groups** (`NINFER_QWEN4_DECODE_GROUPS=2..8`, with rank threads and two or more stages).
   Several decoding requests step as up to that many groups in round robin, each group's plain step
   posted while the others are in the pipeline, with its sampling queued on the head stage's thread;

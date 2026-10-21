@@ -2352,7 +2352,7 @@ struct Qwen4ExpCore::Impl {
     // bookkeeping after it), printed every 100 rounds. A diagnostic of pipelined rounds.
     struct RoundTiming {
         double draft = 0, verify = 0, accept = 0, commit = 0, total = 0;
-        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0;
+        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0, skipped = 0;
     };
     RoundTiming round_timing;
     static bool round_timing_enabled() {
@@ -2368,11 +2368,12 @@ struct Qwen4ExpCore::Impl {
         const double n = double(t.rounds);
         std::fprintf(stderr,
                      "round timing | %llu rounds, %.2f tokens/round, %.0f%% whole windows, guesses "
-                     "%llu held %llu | ms/round: total %.2f draft %.2f verify %.2f accept %.2f "
-                     "commit %.2f\n",
+                     "%llu held %llu not posted %llu | ms/round: total %.2f draft %.2f verify %.2f "
+                     "accept %.2f commit %.2f\n",
                      static_cast<unsigned long long>(t.rounds), double(t.tokens) / n,
                      100.0 * double(t.full) / n, static_cast<unsigned long long>(t.guessed),
-                     static_cast<unsigned long long>(t.held), 1e3 * t.total / n, 1e3 * t.draft / n,
+                     static_cast<unsigned long long>(t.held), static_cast<unsigned long long>(t.skipped),
+                     1e3 * t.total / n, 1e3 * t.draft / n,
                      1e3 * t.verify / n, 1e3 * t.accept / n, 1e3 * t.commit / n);
         t = RoundTiming{};
     }
@@ -2504,19 +2505,26 @@ struct Qwen4ExpCore::Impl {
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
         const auto verify_start = Clock::now();
+        const bool guessing = pipelined && executor.pipeline_guesses();
         if (continuing) {
             executor.verify_guessed(tokens);
         } else {
-            if (pipelined) { executor.guess_after_draft(); }
+            if (guessing) { executor.guess_after_draft(); }
             executor.verify(sequences, tokens);
         }
         // The guess of the window after this one goes to the front ranks while the head rank
-        // verifies this one.
+        // verifies this one, unless the MTP block's estimate of it holding is below the floor
+        // (NINFER_QWEN4_PIPELINE_GUESS).
         std::vector<TokenId> guess;
-        if (pipelined && batch.front()->position + 2 * w <= max_context) {
+        if (guessing && batch.front()->position + 2 * w <= max_context) {
             guess.resize(w);
             executor.take_guess(guess);
-            executor.verify_ahead(guess);
+            if (executor.guess_worth_posting()) {
+                executor.verify_ahead(guess);
+            } else {
+                guess.clear();
+                if (round_timing_enabled()) { round_timing.skipped += 1; }
+            }
         }
 
         RankBinding bind(device, executor.head_rank());

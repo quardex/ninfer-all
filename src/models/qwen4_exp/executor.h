@@ -251,11 +251,18 @@ public:
     bool reserve_kv(std::uint32_t sequence, std::uint32_t tokens);
 
     [[nodiscard]] bool pipeline_windows() const noexcept;
+    // Whether pipeline windows guess at all (NINFER_QWEN4_PIPELINE_GUESS is not "off"); without
+    // guesses the verifications and commits still run on the rank threads.
+    [[nodiscard]] bool pipeline_guesses() const noexcept;
     // After draft() and before verify(): the MTP chain runs on past the drafts to the guess.
     void guess_after_draft();
     // The last guess: the bonus token the window in flight would end with if kept whole, then
     // the drafts after it (draft_tokens() + 1 tokens). Waits for the head rank's chain.
     void take_guess(std::span<std::int32_t> out);
+    // After take_guess(): whether to post the guess (verify_ahead()). Always, unless
+    // NINFER_QWEN4_PIPELINE_GUESS sets a probability that the MTP block's own estimate of the
+    // guess holding (the window in flight's drafts and the guessed bonus all right) stays below.
+    [[nodiscard]] bool guess_worth_posting() const noexcept;
     // The front ranks run `tokens` (a guess) as the window after the one in flight.
     void verify_ahead(std::span<const std::int32_t> tokens);
     [[nodiscard]] bool guess_live() const noexcept;
