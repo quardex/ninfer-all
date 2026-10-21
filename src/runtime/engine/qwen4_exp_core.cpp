@@ -52,8 +52,9 @@ namespace {
 // Prompt chunks in one prefill step while other requests decode (see prefill_step).
 constexpr std::uint32_t kPeerSpanChunks = 2;
 
-// Prompts from this many tokens to their anchor also keep a snapshot at the start of their last
-// message (Request::checkpoint_at), when that start lies at least half as far in.
+// Prompts from this many tokens to their anchor also keep a snapshot at the last chunk boundary of
+// their prefill before their last message (Request::checkpoint_at), when it lies at least half as
+// far in.
 constexpr std::uint32_t kCheckpointMinPrompt = 8192;
 
 using Clock = std::chrono::steady_clock;
@@ -291,7 +292,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // the context cache's per-sequence snapshots take when their first prompts reach an anchor
         // (they are sized then); an explicit size is the cache's size.
         if (!options.expert_cache_bytes) {
-            // Two per sequence: the turn closure's and the last message's (Request::checkpoint_at).
+            // Two per sequence: the turn closure's and the message checkpoint's
+            // (Request::checkpoint_at).
             const std::uint64_t snapshots =
                 options.context_cache.enabled
                     ? 2 * std::uint64_t(options.max_concurrency) * instance->executor->snapshot_bytes()
@@ -436,8 +438,12 @@ struct Qwen4ExpCore::Request {
     // differently), else the prompt's end; and whether the prompt may be reused at all.
     std::uint32_t anchor_at = 0;
     // The start of the prompt's last message before the anchor (0: none): agent clients often
-    // rewrite that message in the next turn's prompt (an environment block dropped from it), and a
-    // snapshot there lets that prompt resume from it rather than from the start.
+    // rewrite that message in the next turn's prompt (an environment block dropped from it).
+    std::uint32_t last_message_at = 0;
+    // Where the sequence keeps a snapshot for such a prompt (0: none): the last chunk boundary of
+    // the prefill at or before last_message_at, set when the prefill starts where a prefill from
+    // position 0 would pass (Impl::begin). Taking it cuts no chunk, and a prompt that resumes from
+    // it computes what a prefill from position 0 computes.
     std::uint32_t checkpoint_at = 0;
     bool reusable           = true;
     bool media              = false; // images or video: encoded at the prompt's first chunk
@@ -479,8 +485,8 @@ struct Qwen4ExpCore::Impl {
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
         models::qwen4_exp::SequenceSnapshot snapshot;
-        // The same at the start of that prompt's last message (Request::checkpoint_at); the slot's
-        // KV holds its positions while it is a prefix of `fed` no longer than the live state kept.
+        // The same at that prompt's message checkpoint (Request::checkpoint_at); the slot's KV
+        // holds its positions while it is a prefix of `fed` no longer than the live state kept.
         std::vector<TokenId> checkpoint;
         models::qwen4_exp::SequenceSnapshot checkpoint_snapshot;
         std::uint64_t last_used = 0;
@@ -1371,6 +1377,7 @@ struct Qwen4ExpCore::Impl {
         // snapshot at the end of its last prompt when the prompt continues that, else from the
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
+        bool from_checkpoint = false;
         if (reuse_prefixes && r.reusable) {
             const std::uint32_t live       = prefix_reuse(slot.fed, r.prompt_tokens);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, r.prompt_tokens);
@@ -1400,8 +1407,9 @@ struct Qwen4ExpCore::Impl {
                 slot.fed     = slot.checkpoint;
                 // The turn closure lay past the checkpoint, in positions the prompt now rewrites.
                 slot.anchor.clear();
-                reused       = checked;
-                r.reuse_path = PrefixReusePath::PrivateLongAnchor;
+                reused          = checked;
+                from_checkpoint = true;
+                r.reuse_path    = PrefixReusePath::PrivateLongAnchor;
             } else if (live > 0) {
                 reused       = live;
                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
@@ -1418,6 +1426,17 @@ struct Qwen4ExpCore::Impl {
         if (slot.checkpoint.size() > reused ||
             !std::equal(slot.checkpoint.begin(), slot.checkpoint.end(), slot.fed.begin())) {
             slot.checkpoint.clear();
+        }
+        // This prompt's message checkpoint, where its prefill passes a chunk boundary that a
+        // prefill from position 0 passes too: from position 0 or from another such checkpoint
+        // (the live state, the turn closure and the store hold positions off that grid, or tokens
+        // decoded rather than prefilled).
+        r.checkpoint_at = 0;
+        if (reuse_prefixes && r.reusable && (reused == 0 || from_checkpoint) &&
+            r.last_message_at > reused) {
+            const std::uint32_t chunk = executor.options().prefill_chunk;
+            const std::uint32_t at    = reused + (r.last_message_at - reused) / chunk * chunk;
+            if (at > reused && at >= kCheckpointMinPrompt / 2) { r.checkpoint_at = at; }
         }
         if (!make_room(s, std::uint64_t(prompt_n) + kv_margin())) {
             if (any_active()) { throw KvPoolBusy{}; }
@@ -2946,7 +2965,7 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
-        // A long prompt also keeps the start of its last message before the anchor.
+        // A long prompt also notes the start of its last message before the anchor.
         if (request->reusable && request->anchor_at >= kCheckpointMinPrompt) {
             std::uint32_t last = 0;
             for (const auto& hint : data.tap_hints.hints) {
@@ -2955,7 +2974,7 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
                     last = hint.position;
                 }
             }
-            if (last >= kCheckpointMinPrompt / 2) { request->checkpoint_at = last; }
+            if (last >= kCheckpointMinPrompt / 2) { request->last_message_at = last; }
         }
     }
     request->prompt_summary  = prompt_summary;
