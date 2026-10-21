@@ -1118,6 +1118,29 @@ decoded at 1,515-1,531 MHz without guesses and the RTX 3090 at 1,522, against 1,
 1,884-1,885 with them; the RTX 3060s stayed at 1,500-1,516 MHz except on B with every guess
 (1,761-1,864). Over the whole request every guess cost 3-5% more energy and saved 10-13 s.
 
+Windows past the native 262,144 positions, the same configuration with every guess and only the RTX
+3060s held at their floor. Each layout's slots, KV format and pool stayed, with two layers moved off
+its fullest card (A `9,9,8,8,14`, B `8,9,18,13`), and the window stepped down by 32,768 from an
+estimate until the warm-up, the 206K prompt and a prompt filling the window all ran. Flash-Next
+has no YaRN, so positions past 262,144 rotate unscaled: these are speeds and memory, not answers.
+The long prompt is the docs prompt with the repository's sources appended:
+
+| Layout, KV | Window | Prompt | Prefill tok/s | Decode tok/s | MTP accepted |
+|---|---:|---:|---:|---:|---:|
+| A, rk8v4, 262,144 window, `8,8,8,8,16` (above) | 262,144 | 206,078 | 1,558 | 52.3 | 59.7% |
+| A, rk8v4, `9,9,8,8,14` | 589,824 | 206,078 | 1,699 | 50.4 | 59.2% |
+| A, rk8v4, `9,9,8,8,14` | 589,824 | 569,916 | 1,417 | 41.5 | 56.3% |
+| B, int8, 262,144 window, `8,8,17,15` (above) | 262,144 | 206,078 | 1,455 | 67.8 | 58.6% |
+| B, int8, `8,9,18,13` | 536,576 | 206,078 | 1,405 | 66.6 | 58.8% |
+| B, int8, `8,9,18,13` | 536,576 | 521,036 | 1,264 | 56.6 | 57.8% |
+
+A at 622,592 started with no device memory left and failed its warm-up in `cudaMalloc`; B at
+569,344 ran the 206K prompt and failed in `cudaMalloc` near the end of a 554,835-token prefill.
+Each sequence's workspace grows with the window (an RTX 3060 stage's from 495 MiB at 262,144 to
+848 MiB at 622,592) beside its pooled indexer keys and the shared KV. At the windows that ran, the
+TITAN RTX held 23,384 MiB on A and 24,127 MiB of 24,576 on B, and reached 87 °C over the long
+prefills. The moved layers changed the 206K texts against the original splits on both layouts.
+
 ### Hyper-connections in Q8_0
 
 The hyper-connection projections (97 down/up pairs and 96 inject matrices) are stored as ggml Q8_0,
