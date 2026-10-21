@@ -960,8 +960,12 @@ between any pair, every card on PCIe x1 risers), CUDA 12.8 build for `75;86`, GP
 | B, int8 | rank threads + pipeline windows, MTP2 (31% held) | 1,590 | 62.2 |
 
 With every guess dropped (`NINFER_QWEN4_PIPELINE_FORCE_MISS=1`) B with rk8v4 and MTP2 still decoded
-at 53.4 tok/s against 43.8 host-ordered: the verifications and commits on the rank threads, which no
-longer wait for each other on the host, are about half of the gain, and the held guesses the rest.
+at 53.4 tok/s against 43.8 host-ordered. The verifications and commits on the rank threads are not
+that gain: with no guesses posted (`NINFER_QWEN4_PIPELINE_GUESS=off`, below) A and B decode as
+without pipeline windows. Runs like these held only the RTX 3060s at a clock floor, and without
+guesses the TITAN RTX and the RTX 3090 averaged 1,380-1,530 MHz while decoding, against 1,840-1,880
+with them: the guessed windows' work, kept or dropped, holds those cards at their boost clocks, the
+likely source of most of it.
 Every pipeline-window run generated the host-ordered run's text at the same draft count. A round of
 B (rk8v4, MTP2) took 45.5 ms host-ordered (draft 4.8, verification 39.9) and 33.9 ms with pipeline
 windows. Through `ninfer-serve` (one slot of 262,144 tokens, a 15-token chat prompt, MTP2) A decoded
@@ -1058,10 +1062,13 @@ one at a time, the batched rounds' were not (four of four differed). Idle, A's c
 the RTX 3060s held at 1,500 MHz and 48 W without; `--gpu-clock-floor` holds the floor only while
 requests run.
 
-At master's default prompt chunk (1,024 tokens) this branch gave master's 1,024-token texts on B's
-206K, code and chat prompts too, and prefilled the 206K prompt at 1,457 tok/s on B and 1,557 on A,
-against 1,614 and 1,753 with 2,048-token chunks (master: 665 against 700). Master's own 206K answer
-differs between the two chunk sizes; the short prompts, one chunk either way, do not.
+At master's default prompt chunk (1,024 tokens), against master in its own defaults (`--spec none`,
+one request at a time), this branch as the API runs it gave master's text byte for byte on all 17
+requests above, on A and on B. The two rewritten agent turns resumed from the message checkpoint at
+position 66,560 (1,024 tokens times 65) and gave their first token after 1.8-2.6 s, against 1 min
+29-30 s on master. The 206K prompt prefilled at 1,457 tok/s on B and 1,557 on A, against 1,614
+and 1,753 with 2,048-token chunks (master: 665 against 700). Master's own 206K answer differs
+between the two chunk sizes; the short prompts, one chunk either way, do not.
 
 | B, int8 | Master, plain | Master, MTP3 | This branch |
 |---|---:|---:|---:|
@@ -1079,6 +1086,37 @@ start, which split a prompt chunk: a 206K turn resumed from it answered in 1.1 s
 12 s but kept a cold prefill's first 85 of 128 tokens only, then took the other side of a 0.125-nat
 tie; a turn resumed from the live state still matches a prefill from scratch only up to rounding (it
 kept all 128 tokens, with logprobs up to 0.153 nats apart), as on master.
+
+Which guesses pipeline windows post (`NINFER_QWEN4_PIPELINE_GUESS`), one request at a time through
+`ninfer-serve` in the API's configuration (1,024-token chunks): the 206K docs prompt with its question
+replaced by one asking for a long answer (206,078 tokens), greedy, up to 2,048 new tokens (A answered
+in 1,961, B in 1,711), one run per row, the decode's power sampled as above. The first set held only
+the RTX 3060s at the 1,500 MHz floor; the second ran through the API, whose server holds every card
+at it (`--gpu-clock-floor 1500`). Held / posted counts the guesses of the rounds the server printed
+(900 on A, 800 on B, a 64-token warm-up's included).
+
+| Layout, KV | Guesses posted | Held / posted | Decode tok/s | W | J/token | Every card floored: tok/s, W, J/token |
+|---|---|---:|---:|---:|---:|---:|
+| A, rk8v4 | no pipeline windows | | 39.0 | 283 | 7.26 | 39.6, 287, 7.23 |
+| A, rk8v4 | none (`off`) | | 38.8 | 278 | 7.17 | |
+| A, rk8v4 | p >= 0.5 | 274 / 451 | 47.4 | 399 | 8.40 | 46.3, 396, 8.55 |
+| A, rk8v4 | p >= 0.25 | 324 / 701 | 50.9 | 426 | 8.36 | |
+| A, rk8v4 | every one | 332 / 900 | 52.3 | 440 | 8.41 | 51.2, 437, 8.52 |
+| B, int8 | no pipeline windows | | 44.9 | 311 | 6.94 | 46.1, 321, 6.94 |
+| B, int8 | none (`off`) | | 44.9 | 311 | 6.93 | |
+| B, int8 | p >= 0.5 | 233 / 391 | 62.3 | 560 | 8.99 | 62.3, 560, 8.99 |
+| B, int8 | p >= 0.25 | 271 / 624 | 64.9 | 598 | 9.21 | |
+| B, int8 | every one | 280 / 800 | 67.8 | 640 | 9.43 | 68.3, 648, 9.47 |
+
+Every run generated the text of the run without pipeline windows, and through the API each level
+also gave master's text on all 17 requests above (master in its defaults). The prefill ran at
+1,558-1,572 tok/s on A and 1,453-1,457 on B in every run. A floor of 0.5 posted half the guesses,
+60-61% of them held against 35-37% of every guess, and gave up about a sixth of the held ones. On A
+it drew 9% less power for 9-10% less speed than every guess, about the same energy a token; on B
+12-14% less power for 8-9% less speed, 5% less energy a token. With every card floored the TITAN RTX
+decoded at 1,515-1,531 MHz without guesses and the RTX 3090 at 1,522, against 1,839-1,881 and
+1,884-1,885 with them; the RTX 3060s stayed at 1,500-1,516 MHz except on B with every guess
+(1,761-1,864). Over the whole request every guess cost 3-5% more energy and saved 10-13 s.
 
 ### Hyper-connections in Q8_0
 
