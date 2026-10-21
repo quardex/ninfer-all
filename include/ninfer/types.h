@@ -553,6 +553,11 @@ struct StagePipelineOptions {
     // a grammar or a draft probability floor: while the head stage verifies a window, the stages
     // before it run the window the MTP block guesses will follow; a wrong guess is dropped.
     bool pipeline_windows = false;
+    // With pipeline windows: post only a guess whose estimate, the MTP block's probabilities of the
+    // window in flight's drafts and of the guessed bonus multiplied, reaches this probability in
+    // [0, 1). A dropped guess costs the front stages a window of work, a guess not posted only the
+    // head stage's draft chain. 0: every guess.
+    float pipeline_guess_min_p = 0;
 };
 
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
