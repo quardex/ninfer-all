@@ -236,6 +236,12 @@ std::string serve_usage_text(const char* argv0) {
            "                                max-concurrency x max-context) instead of a\n"
            "                                window each; every position on the GPU, no host\n"
            "                                or disk context cache\n"
+           "  --message-checkpoint          Qwen3.8-Flash-Next: a prompt of 8192 tokens or\n"
+           "                                more also keeps its state at the last prompt\n"
+           "                                chunk boundary before its last message, where\n"
+           "                                the next prompt resumes when it rewrote that\n"
+           "                                message (agent clients); one more state snapshot\n"
+           "                                per sequence\n"
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1163,6 +1169,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_pool_tokens = static_cast<std::uint32_t>(tokens);
             continue;
         }
+        if (arg == "--message-checkpoint") {
+            options.message_checkpoint = true;
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1749,6 +1759,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (!options.context_cache.disk_kv_path.empty()) {
             throw std::invalid_argument("--no-prefix-reuse cannot be combined with --disk-kv-path");
+        }
+        if (options.message_checkpoint) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with --message-checkpoint");
         }
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;

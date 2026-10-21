@@ -219,6 +219,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--kv-pool N` | (ninfer-serve) the sequences share one KV pool of `N` positions instead of a window each ([the context cache](#sequences-kv-and-the-context-cache)); off by default |
+| `--message-checkpoint` | (ninfer-serve) a long prompt also keeps its state before its last message, for agent clients that rewrite that message in the next turn ([the context cache](#sequences-kv-and-the-context-cache)); off by default |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
@@ -478,7 +479,17 @@ snapshot of its recurrent state where the prompt's last user turn closes (or at 
 when the template marks no turn), 74 MiB on the device: a later prompt that continues what the
 sequence holds resumes from its live state, and one that repeats the prompt up to that point (the
 next turn of a chat, which renders the previous answer without its reasoning) resumes from the
-snapshot.
+snapshot. With `--message-checkpoint` (ninfer-serve; off by default) a prompt of 8,192 tokens or
+more to that point keeps a second snapshot at the last prompt chunk boundary before its last
+message starts (when that lies past half of 8,192), if its prefill started at position 0 or at
+another such snapshot: agent clients rewrite that message in the next turn's prompt (Cline-family
+clients drop an environment block from it), which breaks the turn closure's prefix, and that prompt
+resumes from this snapshot instead ("long anchor" in the request log). The snapshot lies on the
+chunks of a prefill from position 0, so taking it splits no chunk and a prompt resumed from it
+computes exactly what a prefill from scratch computes; a prompt resumed from the live state or the
+turn closure matches one up to rounding (its answer tokens were decoded, and its chunks start
+elsewhere). Each costs another 74 MiB on the device, taken at the sequence's first such prompt;
+with host or disk experts the expert cache leaves that much per sequence at startup.
 Either way only the new tokens are prefilled; the response's prompt summary reports how many were
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
