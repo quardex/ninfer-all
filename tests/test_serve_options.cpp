@@ -1439,10 +1439,19 @@ int main() {
                               "the pipeline stages' modes did not reach the Engine");
             const ninfer::StagePipelineOptions defaults =
                 parse({"ninfer-serve", "model.ninfer"}).stage_pipeline;
-            failures += check(!defaults.rank_threads && !defaults.pipeline_windows,
+            failures += check(!defaults.rank_threads && !defaults.pipeline_windows &&
+                                  defaults.pipeline_guess_min_p == 0.0F,
                               "the pipeline stages' modes were not off by default");
+            failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer",
+                                                         "--rank-threads", "--pipeline-windows",
+                                                         "--pipeline-guess-min-p", "0.5"}))
+                                      .stage_pipeline.pipeline_guess_min_p == 0.5F,
+                              "--pipeline-guess-min-p did not reach the Engine");
             for (const std::vector<std::string>& extra :
-                 {std::vector<std::string>{"--pipeline-windows"}}) {
+                 {std::vector<std::string>{"--pipeline-windows"},
+                  std::vector<std::string>{"--pipeline-guess-min-p", "0.5"},
+                  std::vector<std::string>{"--rank-threads", "--pipeline-windows",
+                                           "--pipeline-guess-min-p", "1"}}) {
                 std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
                 arguments.insert(arguments.end(), extra.begin(), extra.end());
                 bool rejected = false;

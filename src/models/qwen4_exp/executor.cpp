@@ -54,6 +54,7 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -851,6 +852,13 @@ struct Executor::Impl {
         }
         plan_segments();
         pipeline = pipeline_requested();
+        if (pipeline && options.pipeline_guess_min_p > 0) {
+            if (!(options.pipeline_guess_min_p < 1)) {
+                throw std::invalid_argument("qwen4_exp: the guess floor of pipeline windows is a "
+                                            "probability below 1");
+            }
+            guess_floor = std::log(options.pipeline_guess_min_p);
+        }
         allocate_ranks();
         allocate_vision();
         allocate_sequences();
@@ -1572,6 +1580,15 @@ struct Executor::Impl {
         return true;
     }
 
+    // Which guesses pipeline windows post (ExecutorOptions::pipeline_guess_min_p): every one, or
+    // with a probability p in (0, 1) a guess whose estimate - the MTP block's probabilities of the
+    // window in flight's drafts and of the guessed bonus, multiplied - reaches p. A dropped guess
+    // costs the front ranks a window of work; a guess not posted costs only the head rank's chain.
+    float guess_floor = -std::numeric_limits<float>::infinity(); // log p
+    [[nodiscard]] bool guesses_scored() const noexcept {
+        return pipeline && guess_floor > -std::numeric_limits<float>::infinity();
+    }
+
     // What a speculative round needs beyond the sequences' state: on every rank the replay records
     // of its Gated DeltaNet layers with their fold, its sparse-attention layers' indexer
     // projections, the PLE layer's normalised convolution input and scratch states; on the head
@@ -1650,7 +1667,7 @@ struct Executor::Impl {
         mtp_ids       = DeviceBuffer(cells * 4);
         mtp_positions = DeviceBuffer(cells * 4);
         mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
-        if (options.draft_min_p > 0) {
+        if (options.draft_min_p > 0 || guesses_scored()) {
             mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
         }
         // Pipeline windows read a verification's rows on the host thread as they stage it.
@@ -4556,7 +4573,8 @@ struct Executor::Impl {
         auto* logprobs = reinterpret_cast<float*>(host + mtp_ids.bytes / 4);
         std::vector<std::uint32_t> lengths(b, static_cast<std::uint32_t>(k));
         std::size_t ran = k;
-        if (confidence == nullptr || extents.empty()) {
+        // Confidences without a floor score pipeline windows' guesses: the whole chain still runs.
+        if (!(options.draft_min_p > 0) || confidence == nullptr || extents.empty()) {
             replay(drafting.front()->draft.at(k), [&] {
                 for (std::size_t i = 0; i < k; ++i) {
                     step(i);
@@ -4567,6 +4585,10 @@ struct Executor::Impl {
             // The expert cache takes the last verification's routes while the device drafts; the
             // table uploads it queues follow the draft on the stream, before the next pass.
             settle_routes();
+            if (confidence != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(logprobs, confidence, k * b * sizeof(float),
+                                           cudaMemcpyDeviceToHost, rank.stream));
+            }
         } else {
             // The chain ends at the first step after which every sequence has drafted at or below
             // the floor: each step runs from its own graph, and the host reads the step's
@@ -4610,6 +4632,11 @@ struct Executor::Impl {
                 out[j * stride + i] = i < ran ? host[i * b + j] : -1;
             }
             if (!extents.empty()) { extents[j] = lengths[j]; }
+        }
+        // A guess after this window is scored by the window's drafts.
+        if (guesses_scored() && b == 1) {
+            window_drafts_logprob = 0;
+            for (std::size_t i = 0; i < ran; ++i) { window_drafts_logprob += logprobs[i]; }
         }
         return static_cast<std::uint32_t>(ran);
     }
@@ -4832,7 +4859,13 @@ struct Executor::Impl {
         std::uint32_t set = 0, width = 0, position = 0;
         std::vector<std::int32_t> tokens;
     } ahead;
-    std::unique_ptr<PinnedHostBuffer> guess_host;
+    std::unique_ptr<PinnedHostBuffer> guess_host; // the guess's tokens, then from kGuessScores its
+                                                  // steps' log-probabilities (with a guess floor)
+    static constexpr std::size_t kGuessScores = 64;
+    DeviceBuffer guess_logprobs;     // head rank: the guess chain's steps' log-probabilities
+    float window_drafts_logprob = 0; // the MTP block's, of the drafts of the window in flight
+    float guess_bonus_logprob   = 0; // of the last guess's bonus
+    float guess_drafts_logprob  = 0; // of the last guess's drafts
     cudaEvent_t guess_event      = nullptr;
     std::uint64_t guess_posted   = 0; // the host's count of guess chains
     std::uint64_t guess_recorded = 0; // the head thread's (worker_mutex)
@@ -4860,8 +4893,19 @@ struct Executor::Impl {
         RankBinding bind(device, head);
         CUDA_CHECK(cudaEventCreateWithFlags(&ahead_read, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&guess_event, cudaEventDisableTiming));
-        guess_host = std::make_unique<PinnedHostBuffer>(64 * sizeof(std::int32_t));
-        std::fprintf(stderr, "qwen4_exp: pipeline windows on (%zu front segments)\n", head_first);
+        guess_host = std::make_unique<PinnedHostBuffer>(2 * kGuessScores * sizeof(std::int32_t));
+        if (guesses_scored()) {
+            guess_logprobs = DeviceBuffer(std::uint64_t(verify_width) * sizeof(float));
+        }
+        if (guesses_scored()) {
+            std::fprintf(stderr,
+                         "qwen4_exp: pipeline windows on (%zu front segments), guesses estimated "
+                         "to hold with p >= %.3f\n",
+                         head_first, double(std::exp(guess_floor)));
+        } else {
+            std::fprintf(stderr, "qwen4_exp: pipeline windows on (%zu front segments)\n",
+                         head_first);
+        }
     }
 
     std::uint32_t next_set() {
@@ -4906,7 +4950,9 @@ struct Executor::Impl {
         RankState& rank = ranks[model.head_rank()];
         auto* ids       = static_cast<std::int32_t*>(mtp_ids.p);
         const auto* at  = static_cast<const std::int32_t*>(mtp_positions.p);
+        auto* scores    = static_cast<float*>(guess_logprobs.p);
         const MtpPart part{sequence, 0, 1, first};
+        const std::uint32_t k = to / 2; // the guess: steps k .. 2k write cells k + 1 .. 2k + 1
         for (std::uint32_t i = from; i <= to; ++i) {
             if (i == 0) {
                 CUDA_CHECK(cudaMemcpyAsync(sequence->mtp_scratch_tail.p, sequence->mtp.tail.p,
@@ -4917,11 +4963,16 @@ struct Executor::Impl {
                 stage_hidden(rank.stack, 1, 0);
             }
             mtp_pass(std::span(&part, 1), 1, ids + i, at + i, true);
-            mtp_head(1, i + 1 < forced ? ids + kDiscardCell : ids + i + 1);
+            mtp_head(1, i + 1 < forced ? ids + kDiscardCell : ids + i + 1, nullptr,
+                     scores != nullptr && i >= k ? scores + (i - k) : nullptr);
         }
-        const std::uint32_t k = to / 2; // the guess: steps k .. 2k write cells k + 1 .. 2k + 1
         CUDA_CHECK(cudaMemcpyAsync(guess_host->data(), ids + k + 1, (k + 1) * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, rank.stream));
+        if (scores != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(guess_host->data()) + kGuessScores,
+                                       scores, (k + 1) * sizeof(float), cudaMemcpyDeviceToHost,
+                                       rank.stream));
+        }
         CUDA_CHECK(cudaEventRecord(guess_event, rank.stream));
         {
             std::lock_guard lock(worker_mutex);
@@ -4957,6 +5008,17 @@ struct Executor::Impl {
         RankBinding bind(device, model.head_rank());
         CUDA_CHECK(cudaEventSynchronize(guess_event));
         std::memcpy(out.data(), guess_host->data(), out.size() * sizeof(std::int32_t));
+        if (guess_logprobs.p != nullptr && !out.empty()) {
+            const float* scores  = static_cast<const float*>(guess_host->data()) + kGuessScores;
+            guess_bonus_logprob  = scores[0];
+            guess_drafts_logprob = 0;
+            for (std::size_t i = 1; i < out.size(); ++i) { guess_drafts_logprob += scores[i]; }
+        }
+    }
+
+    [[nodiscard]] bool guess_worth_posting() const noexcept {
+        return guess_logprobs.p == nullptr ||
+               window_drafts_logprob + guess_bonus_logprob >= guess_floor;
     }
 
     // The front ranks run `tokens` as the window after the one in flight, taken whole.
@@ -5048,6 +5110,8 @@ struct Executor::Impl {
             !std::equal(tokens.begin(), tokens.end(), ahead.tokens.begin())) {
             throw std::logic_error("qwen4_exp: the verification is not the guessed window");
         }
+        // Its drafts are the guess's: the next guess is scored by them.
+        window_drafts_logprob = guess_drafts_logprob;
         verified.assign(1, &sequence);
         sequence.verify_tokens.assign(tokens.begin(), tokens.end());
         sequence.verify_context = sequence.context;
@@ -5427,6 +5491,8 @@ bool Executor::pipeline_windows() const noexcept { return impl_->pipeline; }
 void Executor::guess_after_draft() { impl_->guess_after_draft(); }
 
 void Executor::take_guess(std::span<std::int32_t> out) { impl_->take_guess(out); }
+
+bool Executor::guess_worth_posting() const noexcept { return impl_->guess_worth_posting(); }
 
 void Executor::verify_ahead(std::span<const std::int32_t> tokens) { impl_->verify_ahead(tokens); }
 
