@@ -276,6 +276,39 @@ void stage_modes_test(const char* artifact) {
     std::cout << "STAGE_MODES failures=" << failures << '\n';
 }
 
+// Decode groups: while two requests decode over two stages, each group holds one of them and runs
+// plain steps. A greedy request generates what it does alone (where plain and MTP decoding agree),
+// a seeded one samples what plain decoding samples for it alone; the seeded one is the shorter, so
+// it decodes beside the other throughout.
+void decode_groups_test(const char* artifact) {
+    const auto greedy = request(256);
+    auto seeded       = request(48);
+    seeded.execution.sampling.temperature = 0.8F;
+    seeded.execution.sampling.top_k       = 20;
+    seeded.execution.sampling.top_p       = 0.95F;
+    seeded.execution.sampling.seed        = 11;
+    std::vector<ninfer::TokenId> greedy_alone, seeded_alone;
+    {
+        ninfer::Engine plain(options(artifact));
+        greedy_alone = plain.generate(plain.prepare(prompt()), greedy).generated_token_ids;
+        seeded_alone = plain.generate(plain.prepare(prompt()), seeded).generated_token_ids;
+    }
+    auto o                          = options(artifact, 2);
+    o.max_concurrency               = 2;
+    o.stage_pipeline.rank_threads   = true;
+    o.stage_pipeline.decode_groups  = 2;
+    ninfer::Engine engine(o);
+    auto first  = engine.submit(engine.prepare(prompt()), greedy);
+    auto second = engine.submit(engine.prepare(prompt()), seeded);
+    const auto long_one  = first.wait();
+    const auto short_one = second.wait();
+    check(long_one.generated_token_ids == greedy_alone,
+          "a greedy request in decode groups generates what it does alone");
+    check(short_one.generated_token_ids == seeded_alone,
+          "a seeded request in decode groups samples what plain decoding samples alone");
+    std::cout << "DECODE_GROUPS failures=" << failures << '\n';
+}
+
 void ngram_cache_test(const char* artifact) {
     const auto input = tokens(700, 19); // two prefill chunks; identical shape in every mode
     for (const auto drafts : {0U, 4U}) {
@@ -539,6 +572,7 @@ int run_test() {
     if (const char* stages_only = std::getenv("NINFER_FLASH_NEXT_STAGES_ONLY");
         stages_only && std::string_view(stages_only) == "1") {
         stage_modes_test(artifact);
+        decode_groups_test(artifact);
         return failures ? 1 : 0;
     }
     auto requests = cases();
@@ -678,6 +712,7 @@ int run_test() {
     }
     cache_test(artifact);
     stage_modes_test(artifact);
+    decode_groups_test(artifact);
     std::cout << "ENGINE_QUALIFICATION target_differences=" << target_differences
               << " batch_differences=" << batch_differences << " failures=" << failures << '\n';
     return failures ? 1 : 0;
