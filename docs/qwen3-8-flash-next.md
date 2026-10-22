@@ -651,12 +651,12 @@ draft-chain graph and each width its own verification graph, captured at their s
   rows back, so the draft chain stays on one device and replays its graph there. With peer access
   between the two the lookup stays on stage 0.
 
-### Stages without peer access (rank threads, pipeline windows)
+### Stages without peer access (rank threads, pipeline windows, decode groups)
 
 Between GPUs without peer access (every GeForce pair under Windows/WDDM), a stream that waits on
 another device's event, or a staged peer copy, blocks the host thread that queues it until the other
 device gets there. One host thread queuing every stage therefore walks each pass through the
-pipeline at device speed, and the stages take turns. Two opt-in modes of `ninfer-serve`
+pipeline at device speed, and the stages take turns. Three opt-in modes of `ninfer-serve`
 (`EngineOptions::stage_pipeline`), for pipeline stages with device experts, change that; none of
 them changes an output:
 
@@ -686,6 +686,13 @@ them changes an output:
   estimate, the MTP block's probabilities of the window in flight's drafts and of the guessed bonus
   multiplied, reaches P: a dropped guess costs the front stages a window of work, a guess not posted
   only the head stage's draft chain.
+- **Decode groups** (`--decode-groups 2..8`, two or more stages, at their best with rank threads).
+  While several requests decode, they step as up to that many groups (no more than the stages) in
+  round robin, each group's plain step posted while the others are in the pipeline, with its
+  sampling queued on the head stage's thread from planes of its own; a request with MTP drafts
+  decodes plainly while it shares the steps, and alone keeps MTP. A group of one request samples
+  what that request samples alone with plain decode. `--decode-group-steps` (1..64, default 8)
+  sets the steps a group runs before the call returns.
 
 A rank thread's failure stops the Engine with every request it holds (`RankThreadsFailed`): the
 passes queued after it were skipped, so no sequence's state can be trusted.
@@ -999,6 +1006,10 @@ with the same text; a sampled request (temperature 0.7), a request cancelled aft
 requests in a row then ran normally. The head stage's embedding copy alone took B's draft chain
 from 8.5 to 6.5 ms a round (MTP3).
 
+Four concurrent chat requests (512 tokens each, four slots of 65,536 tokens, rk8v4): B 139.7 tok/s
+in all with decode groups of four against 45.7 with MTP3 rounds, A 112.4 against 40.9, each
+request's text unchanged; one request alone kept MTP (61.0 and 49.1 tok/s).
+
 A with rk8v4, each row adding one mode to the row before, a 33,009-token prompt and a 1,024-token
 chat through `ninfer-serve`; every text was the first row's:
 
@@ -1027,6 +1038,10 @@ Rank threads run the same passes, only at once: prefill 2.4 times as fast for 1.
 power, 38% less energy a prompt token. Pipeline windows are the one mode that computes what may be
 thrown away: 197 of the 437 guessed windows of A's chat held (45%), 203 of 428 on B (47%), and the
 dropped ones cost 15% (A) and 27% (B) more energy a generated token for 43% and 57% more speed.
+Four chats at once on B (four slots sharing a KV pool) ran at 127.8 tok/s in all with decode groups
+(718 W, 5.62 J/token), against 53.7 one after another on master (290 W, 5.41 J/token) and 41.3 in
+the engine's batched rounds without decode groups (305 W, 7.40 J/token); the decode groups' texts
+were the ones master gave one at a time, the batched rounds' were not (four of four differed).
 
 Which guesses pipeline windows post (`--pipeline-guess-min-p`), one request at a time through
 `ninfer-serve` at 1,024-token chunks: the 206K docs prompt with its question replaced by one asking
@@ -1053,7 +1068,7 @@ token; on B 12-14% less power for 8-9% less speed, 5% less energy a token. Over 
 every guess cost 3-5% more energy and saved 10-13 s.
 
 Against master f6ec88bb in its own defaults (`--spec none`, one request at a time), a build of these
-modes as an API runs them (rank threads, pipeline windows, MTP2; with decode groups of four, a KV
+modes as an API runs them (rank threads, pipeline windows, decode groups of four, MTP2; with a KV
 pool the slots shared and a message checkpoint, submitted separately) gave master's text byte for
 byte on all 17 requests, on A and on B, at 1,024-token chunks, greedy and without logprobs: the 206K
 prompt, the 33K prompt, a code prompt and two 1,024-token chats one at a time; four turns of an agent

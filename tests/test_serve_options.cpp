@@ -1432,15 +1432,18 @@ int main() {
         {
             // The pipeline stages' modes (Flash-Next): off by default, passed to the Engine, and
             // refused where they cannot run.
-            const auto stages =
-                parse({"ninfer-serve", "model.ninfer", "--rank-threads", "--pipeline-windows"});
+            const auto stages = parse({"ninfer-serve", "model.ninfer", "--rank-threads",
+                                       "--pipeline-windows", "--decode-groups", "4",
+                                       "--decode-group-steps", "16"});
             const ninfer::StagePipelineOptions engine = make_engine_options(stages).stage_pipeline;
-            failures += check(engine.rank_threads && engine.pipeline_windows,
+            failures += check(engine.rank_threads && engine.pipeline_windows &&
+                                  engine.decode_groups == 4U && engine.decode_group_steps == 16U,
                               "the pipeline stages' modes did not reach the Engine");
             const ninfer::StagePipelineOptions defaults =
                 parse({"ninfer-serve", "model.ninfer"}).stage_pipeline;
             failures += check(!defaults.rank_threads && !defaults.pipeline_windows &&
-                                  defaults.pipeline_guess_min_p == 0.0F,
+                                  defaults.pipeline_guess_min_p == 0.0F &&
+                                  defaults.decode_groups == 0U && defaults.decode_group_steps == 8U,
                               "the pipeline stages' modes were not off by default");
             failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer",
                                                          "--rank-threads", "--pipeline-windows",
@@ -1451,7 +1454,11 @@ int main() {
                  {std::vector<std::string>{"--pipeline-windows"},
                   std::vector<std::string>{"--pipeline-guess-min-p", "0.5"},
                   std::vector<std::string>{"--rank-threads", "--pipeline-windows",
-                                           "--pipeline-guess-min-p", "1"}}) {
+                                           "--pipeline-guess-min-p", "1"},
+                  std::vector<std::string>{"--decode-groups", "1"},
+                  std::vector<std::string>{"--decode-groups", "9"},
+                  std::vector<std::string>{"--decode-group-steps", "4"},
+                  std::vector<std::string>{"--decode-groups", "2", "--decode-group-steps", "0"}}) {
                 std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
                 arguments.insert(arguments.end(), extra.begin(), extra.end());
                 bool rejected = false;
