@@ -255,6 +255,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (stages.pipeline_windows && !stages.rank_threads) {
         throw std::invalid_argument("Qwen3.8-Flash-Next's pipeline windows run on rank threads");
     }
+    if (stages.decode_groups == 1 || stages.decode_groups > 8 || stages.decode_group_steps == 0 ||
+        stages.decode_group_steps > 64) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's decode groups are 2..8 (0: off), each "
+                                    "call running 1..64 steps");
+    }
     executor.rank_threads     = stages.rank_threads;
     executor.pipeline_windows = stages.pipeline_windows;
     // A chunk also holds a verification of every sequence at once.
@@ -494,6 +499,8 @@ struct Qwen4ExpCore::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    const std::size_t decode_group_count;   // StagePipelineOptions::decode_groups
+    const std::uint32_t decode_group_steps; // StagePipelineOptions::decode_group_steps
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const DiagnosticObserver diagnostics;
@@ -533,6 +540,11 @@ struct Qwen4ExpCore::Impl {
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
+    // Decode groups sample on the executor's head-rank thread (enqueue_plain_sample): planes and a
+    // workspace of their own, which nothing on the Engine's thread touches.
+    DeviceBuffer group_sample_config, group_sample_position, group_sample_out;
+    std::unique_ptr<PinnedHostBuffer> group_host_sample;
+    std::unique_ptr<WorkspaceArena> group_sample_workspace;
     // A speculative round's acceptance on the head device, a row per verified sequence: its
     // drafts, the verification's greedy targets, the live draft count and the tokens fed before
     // the round, and the licensed run (tokens, count, accepted drafts, last token); and every
@@ -581,7 +593,10 @@ struct Qwen4ExpCore::Impl {
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
-          reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          reuse_prefixes(options.context_cache.enabled),
+          decode_group_count(options.stage_pipeline.decode_groups),
+          decode_group_steps(options.stage_pipeline.decode_group_steps),
+          drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
@@ -609,6 +624,16 @@ struct Qwen4ExpCore::Impl {
         sample_out      = DeviceBuffer(rows * sizeof(std::int32_t));
         host_sample     = std::make_unique<PinnedHostBuffer>(
             rows * (sizeof(ops::SamplingConfig) + 2 * sizeof(std::int32_t)));
+        if (decode_group_count >= 2) {
+            group_sample_config    = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
+            group_sample_position  = DeviceBuffer(rows * sizeof(std::int32_t));
+            group_sample_out       = DeviceBuffer(rows * sizeof(std::int32_t));
+            group_host_sample      = std::make_unique<PinnedHostBuffer>(
+                rows * (sizeof(ops::SamplingConfig) + 2 * sizeof(std::int32_t)));
+            group_sample_workspace = std::make_unique<WorkspaceArena>(
+                ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
+                                                       static_cast<std::int32_t>(rows)));
+        }
         token_counts     = DeviceBuffer(rows * domain * sizeof(std::int32_t));
         score_targets    = DeviceBuffer(4096 * sizeof(std::int32_t));
         score_out        = DeviceBuffer(4096 * sizeof(float));
@@ -689,6 +714,10 @@ struct Qwen4ExpCore::Impl {
         }
         queue_cv.notify_all();
         if (worker.joinable()) { worker.join(); }
+        if (!group_done.empty()) {
+            RankBinding bind(device, instance.executor->head_rank());
+            for (cudaEvent_t event : group_done) { cudaEventDestroy(event); }
+        }
     }
 
     [[nodiscard]] std::size_t mask_words() const noexcept {
@@ -1869,6 +1898,19 @@ struct Qwen4ExpCore::Impl {
             }
         }
         if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return; }
+        // With decode groups over a pipeline, several decoding requests run plain steps in groups
+        // that keep every stage busy, which outruns their MTP rounds; a request alone keeps its
+        // drafts (the rounds of one sequence cannot overlap stages).
+        if (decode_groups() >= 2 && device.size() >= 2 && speculative.size() + batch.size() >= 2) {
+            for (const auto& request : speculative) {
+                if (!request->constrained && !request->options.execution.logprobs) {
+                    batch.push_back(request);
+                }
+            }
+            std::erase_if(speculative, [](const auto& r) {
+                return !r->constrained && !r->options.execution.logprobs;
+            });
+        }
         const auto start = Clock::now();
         if (!deferred.empty()) { sample_deferred(deferred); }
         for (const auto& request : alone) {
@@ -1949,10 +1991,222 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
+    // Decode groups (StagePipelineOptions::decode_groups, G >= 2): over a layer pipeline, a plain
+    // step splits its requests into up to G groups and queues one decode pass and the sampling of
+    // each group after the other without waiting, so the first stage runs a group while later
+    // stages run the groups before it; the host waits once for all of them. 0 keeps one pass for
+    // the batch.
+    [[nodiscard]] std::size_t decode_groups() const noexcept { return decode_group_count; }
+
+    // Queues the sampling of `rows` from the first rows.size() columns of `logits` on `stream`
+    // (the head rank's, current) into entries [base, base + rows.size()) of the decode groups'
+    // sampling planes, the tokens copied to the host; no grammar masks or logprobs. collect_plain()
+    // reads them once the stream has finished. It runs on the executor's head-rank thread with
+    // rank threads, so it touches only the groups' own planes and workspace.
+    void enqueue_plain_sample(std::span<const SampleRow> rows, std::size_t base,
+                              cudaStream_t stream, const Tensor& head_logits) {
+        const std::size_t n       = rows.size();
+        auto* configs             = static_cast<ops::SamplingConfig*>(group_host_sample->data());
+        auto* positions           = reinterpret_cast<std::int32_t*>(configs + slots.size());
+        auto* tokens              = positions + slots.size();
+        for (std::size_t b = 0; b < n; ++b) {
+            const SampleRow& row = rows[b];
+            ops::SamplingConfig config;
+            config.temperature       = row.params->temperature;
+            config.top_k             = row.params->top_k;
+            config.top_p             = row.params->top_p;
+            config.min_p             = row.params->min_p;
+            config.presence_penalty  = row.params->presence_penalty;
+            config.frequency_penalty = row.params->frequency_penalty;
+            config.seed              = row.params->seed;
+            config.token_counts =
+                row.counts ? static_cast<std::int32_t*>(token_counts.p) + std::size_t(row.slot) * domain
+                           : nullptr;
+            configs[base + b]   = config;
+            positions[base + b] = static_cast<std::int32_t>(row.position);
+        }
+        auto* device_configs = static_cast<ops::SamplingConfig*>(group_sample_config.p) + base;
+        auto* device_positions = static_cast<std::int32_t*>(group_sample_position.p) + base;
+        auto* device_out       = static_cast<std::int32_t*>(group_sample_out.p) + base;
+        CUDA_CHECK(cudaMemcpyAsync(device_configs, configs + base, n * sizeof(ops::SamplingConfig),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_positions, positions + base, n * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        const auto width = static_cast<std::int32_t>(n);
+        Tensor sampled(device_out, DType::I32, {width});
+        const Tensor logical(device_positions, DType::I32, {width});
+        const Tensor logits(head_logits.data, DType::BF16, {head_logits.ne[0], width});
+        {
+            auto scope = group_sample_workspace->scope();
+            ops::sample(logits, sampled, static_cast<std::int32_t>(domain), device_configs, logical,
+                        ops::kSamplePurposeDecode, *group_sample_workspace, stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(tokens + base, device_out, n * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+
+    // The token enqueue_plain_sample() drew for entry `index`, once the head stream is done.
+    [[nodiscard]] TokenId collect_plain(std::size_t index) const {
+        const auto* configs = static_cast<const ops::SamplingConfig*>(group_host_sample->data());
+        const auto* tokens =
+            reinterpret_cast<const std::int32_t*>(configs + slots.size()) + slots.size();
+        const std::int32_t token = tokens[index];
+        if (token == ops::kSamplerNonFiniteToken || token < 0 || std::uint32_t(token) >= domain) {
+            throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
+        }
+        return token;
+    }
+
+    // Steps a grouped call runs per request (StagePipelineOptions::decode_group_steps): each group
+    // is queued again as soon as its own token is back, while the other groups are still in the
+    // pipeline, so the stages drain once per call instead of once per step.
+    [[nodiscard]] std::uint32_t group_steps() const noexcept { return decode_group_steps; }
+
+    struct DecodeGroup {
+        std::vector<std::shared_ptr<Request>> requests;
+        std::vector<SampleRow> rows; // the step in flight's
+        std::size_t base     = 0; // its entries of the sampling planes
+        std::uint32_t steps  = 0; // left in this call
+        bool in_flight       = false;
+        std::uint64_t issued = 0; // steps queued
+    };
+    std::vector<cudaEvent_t> group_done; // on the head stream, one per group
+    // Steps whose sampling the head-rank callback has queued, by group: the event above belongs
+    // to a step only once its count has caught up.
+    std::mutex group_mutex;
+    std::condition_variable group_cv;
+    std::vector<std::uint64_t> group_sampled;
+
+    // Whether a request of a decode group takes another step in this call.
+    [[nodiscard]] bool keeps_stepping(const std::shared_ptr<Request>& request) const {
+        return active(request) && request->decoding && request->feed.size() == 1 &&
+               !request->awaiting_sample && !request->constrained &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               request->position + 1 <= max_context;
+    }
+
+    // Queues one decode pass of the group and the sampling of its tokens.
+    void issue_group(const std::shared_ptr<DecodeGroup>& group, std::size_t index) {
+        std::erase_if(group->requests, [&](const auto& r) { return !keeps_stepping(r); });
+        if (group->requests.empty() || group->steps == 0) {
+            group->in_flight = false;
+            return;
+        }
+        auto& executor = *instance.executor;
+        std::vector<std::uint32_t> sequences;
+        std::vector<TokenId> tokens;
+        group->rows.clear();
+        for (const auto& request : group->requests) {
+            sequences.push_back(request->slot);
+            tokens.push_back(request->feed.front());
+            group->rows.push_back(sample_row(*request));
+        }
+        const std::uint64_t step = ++group->issued;
+        // The sampling follows the head on the head stream, queued by whoever queues the head (the
+        // head rank's thread with rank threads), so a later group's head cannot overwrite these
+        // logits before they are read. The callback holds the group, which may outlive the call
+        // that queued it when the call fails.
+        executor.decode(sequences, tokens,
+                        [this, group, index, step](cudaStream_t stream, const Tensor& logits) {
+                            enqueue_plain_sample(group->rows, group->base, stream, logits);
+                            CUDA_CHECK(cudaEventRecord(group_done[index], stream));
+                            {
+                                std::lock_guard lock(group_mutex);
+                                group_sampled[index] = step;
+                            }
+                            group_cv.notify_all();
+                        });
+        group->in_flight = true;
+        --group->steps;
+    }
+
+    // A plain step in decode groups (decode_groups()); requests with grammar masks or logprobs
+    // take the one-pass step.
+    [[nodiscard]] bool grouped_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        const std::size_t count = std::min({decode_groups(), batch.size(), device.size()});
+        if (count < 2) { return false; }
+        for (const auto& request : batch) {
+            if (request->constrained || request->options.execution.logprobs) { return false; }
+        }
+        auto& executor = *instance.executor;
+        {
+            RankBinding bind(device, executor.head_rank());
+            while (group_done.size() < count) {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                group_done.push_back(event);
+            }
+        }
+        {
+            std::lock_guard lock(group_mutex);
+            group_sampled.assign(count, 0);
+        }
+        // Contiguous groups whose sizes differ by at most one.
+        std::vector<std::shared_ptr<DecodeGroup>> groups(count);
+        std::size_t begin = 0;
+        for (std::size_t g = 0; g < count; ++g) {
+            const std::size_t end = begin + (batch.size() - begin) / (count - g);
+            groups[g]        = std::make_shared<DecodeGroup>();
+            groups[g]->requests.assign(batch.begin() + std::ptrdiff_t(begin),
+                                       batch.begin() + std::ptrdiff_t(end));
+            groups[g]->base  = begin;
+            groups[g]->steps = group_steps();
+            begin            = end;
+        }
+        try {
+            for (std::size_t g = 0; g < count; ++g) { issue_group(groups[g], g); }
+            // Round robin: each group's tokens are taken as soon as they are back, and the group is
+            // queued again behind the others.
+            for (bool any = true; any;) {
+                any = false;
+                for (std::size_t g = 0; g < count; ++g) {
+                    DecodeGroup& group = *groups[g];
+                    if (!group.in_flight) { continue; }
+                    any = true;
+                    await_group(g, group.issued);
+                    CUDA_CHECK(cudaEventSynchronize(group_done[g]));
+                    for (std::size_t b = 0; b < group.requests.size(); ++b) {
+                        const auto& request = group.requests[b];
+                        slots[request->slot].fed.push_back(request->feed.front());
+                        request->position += 1;
+                        if (drafts > 0) { ++request->speculative.fallback_steps; }
+                        try {
+                            accept(request, collect_plain(group.base + b), nullptr);
+                            next_mask(request);
+                        } catch (...) { fail(request, std::current_exception()); }
+                    }
+                    issue_group(groups[g], g);
+                }
+            }
+        } catch (...) {
+            // Let the head rank's thread finish the callbacks it was given before the failure
+            // goes up (a failed thread's error is the one already on its way).
+            try {
+                (void)executor.head_stream();
+            } catch (...) {}
+            throw;
+        }
+        return true;
+    }
+
+    // Waits until group `g`'s callback has queued the sampling of step `step`. A rank thread that
+    // failed never runs it, so the wait looks at the threads now and then.
+    void await_group(std::size_t g, std::uint64_t step) {
+        auto& executor = *instance.executor;
+        std::unique_lock lock(group_mutex);
+        while (!group_cv.wait_for(lock, std::chrono::milliseconds(50),
+                                  [&] { return group_sampled[g] >= step; })) {
+            lock.unlock();
+            executor.check_rank_threads();
+            lock.lock();
+        }
+    }
+
     // One batched decode step of the requests that feed one token, whose experts read their weights
     // once. A grammar row whose mask is still being computed keeps its logits for later; the step
     // itself does not wait for the mask.
     void plain_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        if (grouped_step(batch)) { return; }
         auto& executor = *instance.executor;
         std::vector<std::uint32_t> sequences;
         std::vector<TokenId> tokens;

@@ -816,6 +816,8 @@ std::string format_server_start_json(
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"rank_threads", engine_options.stage_pipeline.rank_threads},
         {"pipeline_windows", engine_options.stage_pipeline.pipeline_windows},
+        {"decode_groups", engine_options.stage_pipeline.decode_groups},
+        {"decode_group_steps", engine_options.stage_pipeline.decode_group_steps},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
         {"model_suspend", engine_options.suspend.enabled},

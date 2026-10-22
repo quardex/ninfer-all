@@ -74,7 +74,7 @@ struct ServeOptions {
     HybridExpertOptions hybrid_experts;
     NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
-    // Flash-Next: --rank-threads, --pipeline-windows.
+    // Flash-Next: --rank-threads, --pipeline-windows, --decode-groups, --decode-group-steps.
     StagePipelineOptions stage_pipeline;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

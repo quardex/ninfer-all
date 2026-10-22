@@ -553,6 +553,12 @@ struct StagePipelineOptions {
     // a grammar or a draft probability floor: while the head stage verifies a window, the stages
     // before it run the window the MTP block guesses will follow; a wrong guess is dropped.
     bool pipeline_windows = false;
+    // 2..8 (0: off): a plain decode step of several requests runs as up to this many groups queued
+    // one after another, so the stages work on different groups at once; while two or more
+    // requests decode, those with MTP drafts decode plainly. Each call runs decode_group_steps
+    // steps (1..64) of every group.
+    std::uint32_t decode_groups      = 0;
+    std::uint32_t decode_group_steps = 8;
 };
 
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.

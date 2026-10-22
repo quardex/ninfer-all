@@ -222,6 +222,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                run the guessed next one (a lone request without\n"
            "                                logprobs, a grammar or --draft-min-p); same\n"
            "                                outputs\n"
+           "  --decode-groups N             Qwen3.8-Flash-Next over --devices: 2..8 groups of\n"
+           "                                the decoding requests, queued one after another\n"
+           "                                so the stages overlap; requests with MTP decode\n"
+           "                                plainly while two or more run\n"
+           "  --decode-group-steps N        decode steps a group call runs, 1..64 (default 8)\n"
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -580,6 +585,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_state_slots_explicit    = false;
     bool host_kv_mib_explicit         = false;
     bool host_cache_budget_explicit   = false;
+    bool decode_group_steps_explicit  = false;
     bool host_cache_reserve_explicit  = false;
     bool long_anchor_spacing_explicit = false;
     bool ngram_width_explicit         = false;
@@ -1114,6 +1120,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--pipeline-windows") {
             options.stage_pipeline.pipeline_windows = true;
+            continue;
+        }
+        if (arg == "--decode-groups") {
+            const int groups =
+                parse_nonnegative_int(require_value("--decode-groups"), "decode-groups");
+            if (groups < 2 || groups > 8) {
+                throw std::invalid_argument("--decode-groups takes 2..8");
+            }
+            options.stage_pipeline.decode_groups = static_cast<std::uint32_t>(groups);
+            continue;
+        }
+        if (arg == "--decode-group-steps") {
+            const int steps = parse_nonnegative_int(require_value("--decode-group-steps"),
+                                                    "decode-group-steps");
+            if (steps < 1 || steps > 64) {
+                throw std::invalid_argument("--decode-group-steps takes 1..64");
+            }
+            options.stage_pipeline.decode_group_steps = static_cast<std::uint32_t>(steps);
+            decode_group_steps_explicit               = true;
             continue;
         }
         if (arg == "--stage-layers") {
@@ -1662,6 +1687,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.stage_pipeline.pipeline_windows && !options.stage_pipeline.rank_threads) {
         throw std::invalid_argument("--pipeline-windows requires --rank-threads");
+    }
+    if (decode_group_steps_explicit && options.stage_pipeline.decode_groups == 0) {
+        throw std::invalid_argument("--decode-group-steps requires --decode-groups");
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
