@@ -81,7 +81,7 @@ Flash-Next keeps its own stage loop (`models/qwen4_exp/executor.cpp`): segments 
 layers per device, the residual stack handed on between them, and the head, sampling and MTP block
 on the last stage. By default one host thread queues a pass's segments stage after stage. Between
 GPUs without peer access (Windows/WDDM) every cross-stage wait blocks that thread until the other
-device gets there, so the stages take turns. Two opt-in modes (`EngineOptions::stage_pipeline`)
+device gets there, so the stages take turns. Three opt-in modes (`EngineOptions::stage_pipeline`)
 change the queuing, never the arithmetic:
 
 - **Rank threads.** The Engine's thread stages a pass's inputs (tokens, positions, n-gram rows) in
@@ -97,6 +97,9 @@ change the queuing, never the arithmetic:
   Gated DeltaNet pool, copies of the indexer tails and PLE histories) while the head verifies the
   current one; a second set of replay records keeps every prefix of the window in flight
   committable. A wrong guess is dropped.
+- **Decode groups.** Several decoding requests step as groups queued one after another, so the
+  stages work on different groups at once, each group's sampling queued on the head stage's thread
+  from planes of its own.
 
 ## What is not covered yet
 

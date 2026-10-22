@@ -2299,6 +2299,7 @@ struct Executor::Impl {
         bool catch_up = false;                   // run the MTP catch-up on the head rank
         std::vector<Committed> committed;        // its tokens point into `tokens`
         std::vector<std::int32_t> tokens;
+        Executor::AfterHead after_head;          // on the head rank's thread, after the head
         // Pipeline windows: the pass's kind, the segments it runs, per-segment graphs to replay,
         // whether its stack crosses to the head rank through the guessed window's buffer (a
         // guessed window) or the head rank's segments take it from there (its verification), and
@@ -2624,6 +2625,9 @@ struct Executor::Impl {
                 mtp_catch_up(task.committed,
                              static_cast<const std::byte*>(embedded_host[task.slot]->data()));
             }
+            if (segment.head && task.after_head) {
+                task.after_head(rank.stream, head_logits(std::size_t(task.logit_rows)));
+            }
             if (i + 1 < segments.size() && segments[i + 1].rank != r) {
                 if (task.to_ahead && i + 1 == end) {
                     send_ahead(r, task, task.ahead_number);
@@ -2652,7 +2656,7 @@ struct Executor::Impl {
     // Prepares a pass's inputs on the host and posts it to the rank threads; the sequences'
     // positions advance at once (the threads read positions from the staged planes).
     void threaded_pass(std::span<const Part> parts, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows) {
+                       std::uint32_t logit_rows, Executor::AfterHead after_head = {}) {
         const auto t = static_cast<std::int32_t>(tokens.size());
         for (const Part& part : parts) {
             if (part.sequence->position + std::uint32_t(part.count) > options.max_context) {
@@ -2661,7 +2665,8 @@ struct Executor::Impl {
         }
         std::vector<NgramContext*> contexts;
         for (const Part& part : parts) { contexts.push_back(&part.sequence->context); }
-        auto task = stage_task(parts, tokens, logit_rows, contexts, 0, segments.size());
+        auto task        = stage_task(parts, tokens, logit_rows, contexts, 0, segments.size());
+        task->after_head = std::move(after_head);
         // Decode graphs: the first single-token pass runs eagerly, the second captures them (with
         // the threads drained, since a capture forbids other threads' launches).
         SequenceState& first = *parts.front().sequence;
@@ -4084,7 +4089,8 @@ struct Executor::Impl {
         }
     }
 
-    void decode(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
+    void decode(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens,
+                Executor::AfterHead after_head) {
         if (batch.empty() || batch.size() != tokens.size()) {
             throw std::invalid_argument("qwen4_exp decode: one token per sequence");
         }
@@ -4101,7 +4107,8 @@ struct Executor::Impl {
             parts.push_back({.sequence = sequence, .column = std::int32_t(j), .count = 1});
         }
         if (threadable(parts, static_cast<std::int32_t>(tokens.size()))) {
-            threaded_pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
+            threaded_pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()),
+                          std::move(after_head));
             return;
         }
         drain();
@@ -4112,6 +4119,16 @@ struct Executor::Impl {
         }
         pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
         if (mtp) { mtp_catch_up(committed); }
+        if (after_head) {
+            RankBinding bind(device, model.head_rank());
+            after_head(ranks[model.head_rank()].stream, head_logits(tokens.size()));
+        }
+    }
+
+    [[nodiscard]] Tensor head_logits(std::size_t rows) const {
+        return Tensor(ranks[model.head_rank()].logits, DType::BF16,
+                      {static_cast<std::int32_t>(config.vocab_size),
+                       static_cast<std::int32_t>(rows)});
     }
 
     void warm_up() {
@@ -5425,7 +5442,12 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
 
 void Executor::decode(std::span<const std::uint32_t> sequences,
                       std::span<const std::int32_t> tokens) {
-    impl_->decode(sequences, tokens);
+    impl_->decode(sequences, tokens, {});
+}
+
+void Executor::decode(std::span<const std::uint32_t> sequences,
+                      std::span<const std::int32_t> tokens, AfterHead after_head) {
+    impl_->decode(sequences, tokens, std::move(after_head));
 }
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
@@ -5535,6 +5557,11 @@ ExpertCacheStats Executor::expert_cache_stats() const noexcept {
 cudaStream_t Executor::head_stream() const {
     impl_->drain_head();
     return impl_->ranks[impl_->model.head_rank()].stream;
+}
+
+void Executor::check_rank_threads() const {
+    std::unique_lock lock(impl_->worker_mutex);
+    if (impl_->worker_error) { impl_->raise_worker_error(); }
 }
 
 std::string Executor::expert_execution_profile() const {
