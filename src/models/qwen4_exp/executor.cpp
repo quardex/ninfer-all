@@ -4290,7 +4290,7 @@ struct Executor::Impl {
         prefill(2);
         const std::uint32_t sequence = 0;
         if (sequences.front().position + 1 < options.max_context) {
-            decode(std::span(&sequence, 1), std::span(tokens).first(1));
+            decode(std::span(&sequence, 1), std::span(tokens).first(1), {});
         }
         if (mtp && can_draft(0) &&
             sequences.front().position + verify_width <= options.max_context) {
