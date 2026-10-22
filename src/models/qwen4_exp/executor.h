@@ -30,6 +30,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -191,6 +192,13 @@ public:
     // leaves their logits in logits(), one column per sequence in that order. The experts read
     // their weights once for the whole batch; each sequence's mixers run on its own state.
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
+    // The same, and `after_head` runs once the pass's head is queued, with the head stream and
+    // the pass's logits: work it queues there reads them before any later pass overwrites them.
+    // With rank threads it runs on the head rank's thread (the caller must not touch the head
+    // stream or logits() before it has run); otherwise before decode() returns.
+    using AfterHead = std::function<void(cudaStream_t, const Tensor&)>;
+    void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                AfterHead after_head);
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     // Device bytes one SequenceSnapshot's buffers take once its first snapshot sizes them.
@@ -279,6 +287,8 @@ public:
     void bind_cancellation(const std::atomic<bool>* cancelled) noexcept;
     // Waits until the head rank's thread has queued every posted pass (rank threads).
     [[nodiscard]] cudaStream_t head_stream() const;
+    // Throws RankThreadsFailed once a rank thread has failed; never waits.
+    void check_rank_threads() const;
 
 private:
     struct Impl;
