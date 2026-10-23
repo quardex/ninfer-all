@@ -2247,7 +2247,11 @@ struct Qwen4ExpCore::Impl {
         for (const auto& request : group->requests) {
             sequences.push_back(request->slot);
             tokens.push_back(request->feed.front());
-            group->rows.push_back(sample_row(*request));
+            // The step samples the position after the token it feeds, where plain_step() samples
+            // once it has advanced the request: a seeded row draws plain decoding's numbers.
+            SampleRow row = sample_row(*request);
+            row.position += 1;
+            group->rows.push_back(row);
         }
         const std::uint64_t step = ++group->issued;
         // The sampling follows the head on the head stream, queued by whoever queues the head (the

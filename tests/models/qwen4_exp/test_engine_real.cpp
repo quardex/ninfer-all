@@ -277,9 +277,11 @@ void stage_modes_test(const char* artifact) {
 }
 
 // Decode groups: while two requests decode over two stages, each group holds one of them and runs
-// plain steps. A greedy request generates what it does alone (where plain and MTP decoding agree),
-// a seeded one samples what plain decoding samples for it alone; the seeded one is the shorter, so
-// it decodes beside the other throughout.
+// plain steps. Without MTP every step is plain, so a greedy request generates what it does alone and
+// a seeded one samples what it samples alone; the seeded one is the shorter, so it decodes beside
+// the other throughout. (With MTP the greedy one would also take MTP rounds alone, whose tokens
+// need not be plain decoding's: on the Q2_0 artifact over a TITAN RTX + RTX 3090, MTP2 and plain
+// decoding part at the 85th character of this prompt's answer, without decode groups.)
 void decode_groups_test(const char* artifact) {
     const auto greedy = request(256);
     auto seeded       = request(48);
@@ -293,7 +295,7 @@ void decode_groups_test(const char* artifact) {
         greedy_alone = plain.generate(plain.prepare(prompt()), greedy).generated_token_ids;
         seeded_alone = plain.generate(plain.prepare(prompt()), seeded).generated_token_ids;
     }
-    auto o                          = options(artifact, 2);
+    auto o                          = options(artifact);
     o.max_concurrency               = 2;
     o.stage_pipeline.rank_threads   = true;
     o.stage_pipeline.decode_groups  = 2;
