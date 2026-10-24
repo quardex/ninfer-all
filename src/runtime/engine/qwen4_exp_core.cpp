@@ -1855,6 +1855,12 @@ struct Qwen4ExpCore::Impl {
         executor.forward(r.slot, chunk, 1, next);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
+        {
+            // Counted chunk by chunk, as engine_core counts Qwen3.5's, so the 5-second throughput
+            // reports show a long prompt being read instead of all of it in the interval it ends.
+            std::lock_guard lock(stats_mutex);
+            stats.computed_prefill_tokens += n;
+        }
         if (reuse_prefixes && r.reusable && r.checkpoint_at != 0 && r.prefilled == r.checkpoint_at) {
             executor.snapshot(r.slot, slot.checkpoint_snapshot);
             slot.checkpoint = slot.fed;
@@ -1879,7 +1885,6 @@ struct Qwen4ExpCore::Impl {
         r.prefill_end = Clock::now();
         {
             std::lock_guard lock(stats_mutex);
-            stats.computed_prefill_tokens += prompt_n - r.reused;
             stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
         }
         const auto& exec = r.options.execution;
