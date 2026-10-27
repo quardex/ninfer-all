@@ -99,6 +99,10 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
+    // The tokens a prompt renders to (what /apply-template shows), at any length for a text
+    // prompt; only generation is held to max_context.
+    [[nodiscard]] std::vector<TokenId> render_tokens(PromptInput input,
+                                                     const PreparationControl& control = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an

@@ -1412,6 +1412,30 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
 
+std::vector<TokenId> Frontend::render_tokens(PromptInput input,
+                                             const PreparationControl& control) const {
+    const bool has_media =
+        std::any_of(input.messages.begin(), input.messages.end(), [](const ChatMessage& message) {
+            return std::any_of(message.parts.begin(), message.parts.end(), [](const MessagePart& part) {
+                return part.kind == MessagePartKind::Media;
+            });
+        });
+    if (has_media || impl_->find_graft(input.options.graft) != nullptr) {
+        const PreparedPrompt prepared = prepare(std::move(input), control);
+        const auto ids                = prepared.token_ids();
+        return {ids.begin(), ids.end()};
+    }
+    fi::check_preparation_control(control);
+    const PromptOptions options           = input.options;
+    std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    const fi::RenderedChat rendered       = impl_->chat_template.render(
+        messages, render_options(options, impl_->tool_call_syntax()), control);
+    fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+    fi::check_preparation_control(control, "tokenization");
+    (void)checked_token_count(encoded.input_ids.size());
+    return std::move(encoded.input_ids);
+}
+
 MediaCacheSummary Frontend::media_cache_summary() const {
     if (impl_ == nullptr || !impl_->media_cache) { return {}; }
     const fi::MediaCacheStats stats = impl_->media_cache->stats();

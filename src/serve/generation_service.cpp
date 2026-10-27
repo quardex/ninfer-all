@@ -601,9 +601,10 @@ std::string GenerationService::render_prompt(const GenerationRequest& request,
             .deadline     = deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        const ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        // Rendered at any length: a client counts a prompt before it decides to shorten it, so
+        // only generation is held to max_context.
         std::string text;
-        for (const ninfer::TokenId token : prompt.token_ids()) {
+        for (const ninfer::TokenId token : engine_->render_tokens(std::move(input), control)) {
             text += engine_->token_bytes(token);
         }
         return text;

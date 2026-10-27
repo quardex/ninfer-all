@@ -99,6 +99,11 @@ public:
                                          const PreparationControl& control = {}) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
+    // The tokens a text prompt renders and encodes to, at any length: count_tokens' route with
+    // the tokens kept. A prompt with media or a graft is prepared as for generation, so
+    // max_context holds for it.
+    [[nodiscard]] std::vector<TokenId> render_tokens(PromptInput input,
+                                                     const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true,
                                                 bool anchor_prompt_end     = false) const;

@@ -726,6 +726,12 @@ std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& 
     return impl_->frontend().count_tokens(std::move(input), control);
 }
 
+std::vector<TokenId> Engine::render_tokens(PromptInput input,
+                                           const PreparationControl& control) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().render_tokens(std::move(input), control);
+}
+
 ModelSamplingDefaults Engine::sampling_defaults() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->sampling_defaults;

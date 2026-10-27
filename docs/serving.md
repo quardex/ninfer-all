@@ -1353,7 +1353,7 @@ The tokenizer endpoints answer from the host, so they do not wake a sleeping mod
 |---|---|---|
 | `POST /tokenize` | `content`; `parse_special` (default true: special-token text encodes as that token); `with_pieces`; `add_special` (accepted; Qwen checkpoints add no BOS) | `{"tokens": [ids]}`, or `[{"id", "piece"}]` with `with_pieces`, a piece that is not whole UTF-8 given as its bytes |
 | `POST /detokenize` | `tokens` | `{"content": text}`, special tokens included |
-| `POST /apply-template` | a Chat Completions body | `{"prompt": text}`: the prompt the request renders to, the assistant opener included |
+| `POST /apply-template` | a Chat Completions body | `{"prompt": text}`: the prompt the request renders to, the assistant opener included, at any length for a text prompt (a client counts a prompt before it shortens it; only generation is held to `--max-context`) |
 
 ## Rerank
 
